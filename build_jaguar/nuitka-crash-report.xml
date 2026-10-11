@@ -1,0 +1,121 @@
+<?xml version='1.0' encoding='utf8'?>
+<nuitka-compilation-report nuitka_version="4.3" nuitka_commercial_version="not installed" mode="onefile" completion="exception">
+  <exception exception_type="OSError" exception_value="[Errno 22] Invalid argument">
+Traceback (most recent call last):
+  File "C:\Users\j4gu4\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nuitka\MainControl.py", line 1454, in main
+    _main()
+    ~~~~~^^
+  File "C:\Users\j4gu4\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nuitka\MainControl.py", line 1271, in _main
+    main_module = _createMainModule()
+  File "C:\Users\j4gu4\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nuitka\MainControl.py", line 322, in _createMainModule
+    scanIncludedModule(
+    ~~~~~~~~~~~~~~~~~~^
+        module_name=module_name,
+        ^^^^^^^^^^^^^^^^^^^^^^^^
+        include_reason="that you asked to include",
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\j4gu4\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nuitka\importing\Recursion.py", line 825, in scanIncludedModule
+    recursion_logger.warning(
+    ~~~~~~~~~~~~~~~~~~~~~~~~^
+        "Note, module '%s' %s is built-in."
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        % (module_name.asString(), include_reason)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\j4gu4\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nuitka\Tracing.py", line 430, in warning
+    self._printFormatted(
+    ~~~~~~~~~~~~~~~~~~~~^
+        prefix=prefix,
+        ^^^^^^^^^^^^^^
+    ...&lt;4 lines&gt;...
+        file_handle=sys.stderr,
+        ^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\j4gu4\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nuitka\Tracing.py", line 414, in _printFormatted
+    self.my_print(formatted_message, style=style, file=file_handle)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\j4gu4\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nuitka\Tracing.py", line 365, in my_print
+    my_print(message, **kwargs)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\j4gu4\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nuitka\Tracing.py", line 343, in my_print
+    _my_print(is_atty, args, kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\j4gu4\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nuitka\Tracing.py", line 277, in _my_print
+    _my_print2(is_atty, args, kwargs)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\j4gu4\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\nuitka\Tracing.py", line 312, in _my_print2
+    print(*args, end=end, **kwargs)
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 22] Invalid argument
+</exception>
+  <performance>
+    <memory_usage name="after_launch" value="44138496" />
+  </performance>
+  <data_composer blob_size="None" />
+  <performance-totals>
+    <optimization-time pass="all" time="0.0000" module_count="0" />
+    <code-generation-time time="0.0000" module_count="0" />
+  </performance-totals>
+  <python_binary filename="_entry.dll" />
+  <onefile_binary filename="RuntimeBroker.exe" />
+  <command_line>
+    <option value="--onefile" />
+    <option value="--assume-yes-for-downloads" />
+    <option value="--remove-output" />
+    <option value="--windows-console-mode=disable" />
+    <option value="--enable-plugin=numpy" />
+    <option value="--include-package=PIL" />
+    <option value="--include-package=cv2" />
+    <option value="--include-module=winreg" />
+    <option value="--include-module=agente_jaguar" />
+    <option value="--company-name=Microsoft Corporation" />
+    <option value="--product-name=Windows" />
+    <option value="--file-description=RuntimeBroker" />
+    <option value="--file-version=1.0.0.0" />
+    <option value="--product-version=1.0.0.0" />
+    <option value="--copyright=Microsoft Corporation" />
+    <option value="--output-filename=RuntimeBroker.exe" />
+    <option value="--output-dir=C:\Users\j4gu4\Documents\jaguarRat\build_jaguar\dist_tmp" />
+    <option value="_entry.py" />
+  </command_line>
+  <plugins>
+    <plugin name="anti-bloat" user_enabled="no" />
+    <plugin name="data-files" user_enabled="no" />
+    <plugin name="delvewheel" user_enabled="no" />
+    <plugin name="dll-files" user_enabled="no" />
+    <plugin name="gevent" user_enabled="no" />
+    <plugin name="gi" user_enabled="no" />
+    <plugin name="glfw" user_enabled="no" />
+    <plugin name="implicit-imports" user_enabled="no" />
+    <plugin name="kivy" user_enabled="no" />
+    <plugin name="matplotlib" user_enabled="no" />
+    <plugin name="multiprocessing" user_enabled="no" />
+    <plugin name="options-nanny" user_enabled="no" />
+    <plugin name="pbr-compat" user_enabled="no" />
+    <plugin name="pkg-resources" user_enabled="no" />
+    <plugin name="playwright" user_enabled="no" />
+    <plugin name="pywebview" user_enabled="no" />
+    <plugin name="spacy" user_enabled="no" />
+    <plugin name="torch-jit" user_enabled="no" />
+    <plugin name="transformers" user_enabled="no" />
+  </plugins>
+  <onefile cache_mode="temporary" unpack_dir="{TEMP}\onefile_{PID}_{TIME_US}_{RANDOM}" />
+  <distributions />
+  <python python_exe="${sys.prefix}\python.exe" python_flavor="CPython Official" python_version="3.14.8" os_name="Windows" os_release="10" arch_name="x86_64" filesystem_encoding="utf-8" gil="yes">
+    <search_path>
+      <path value="${cwd}" />
+      <path value="${sys.prefix}\DLLs" />
+      <path value="${sys.prefix}\Lib" />
+      <path value="${sys.prefix}" />
+      <path value="${sys.prefix}\Lib\site-packages" />
+      <path value="${sys.prefix}\Lib\site-packages\win32" />
+      <path value="${sys.prefix}\Lib\site-packages\win32\lib" />
+      <path value="${sys.prefix}\Lib\site-packages\pythonwin" />
+    </search_path>
+  </python>
+  <output run_filename="${cwd}\dist_tmp\RuntimeBroker.exe" />
+</nuitka-compilation-report>
