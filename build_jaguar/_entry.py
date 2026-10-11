@@ -2,7 +2,7 @@ import os, sys, subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _HOST = 'jaguarxxx.duckdns.org'
 _PORT = '8000'
-_HOST2 = '46.246.84.2'
+_HOST2 = '46.246.14.20'
 os.environ.setdefault('JAGUAR_HOST', _HOST)
 os.environ.setdefault('JAGUAR_PORT', _PORT)
 os.environ.setdefault('JAGUAR_HOST2', _HOST2)
