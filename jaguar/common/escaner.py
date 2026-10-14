@@ -6,14 +6,32 @@ import socket
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-PUERTOS_COMUNES = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 1433,
-                   1521, 3306, 3389, 5432, 5900, 5985, 6379, 8000, 8080, 8443]
-_SERVICIOS = {21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
-              80: "http", 110: "pop3", 135: "msrpc", 139: "netbios", 143: "imap",
-              443: "https", 445: "smb", 1433: "mssql", 1521: "oracle",
-              3306: "mysql", 3389: "rdp", 5432: "postgres", 5900: "vnc",
-              5985: "winrm", 6379: "redis", 8000: "http-alt", 8080: "http-alt",
-              8443: "https-alt"}
+CREATE_NO_WINDOW = 0x08000000
+
+PUERTOS_COMUNES = [20, 21, 22, 23, 25, 53, 67, 68, 69, 80, 88, 110, 111, 123,
+                   135, 137, 138, 139, 143, 161, 389, 443, 445, 464, 500, 512,
+                   513, 514, 587, 636, 873, 990, 993, 995, 1025, 1080, 1099,
+                   1433, 1434, 1521, 1701, 1723, 1900, 2049, 2082, 2083, 2181,
+                   2375, 2376, 3000, 3128, 3268, 3306, 3389, 3690, 4444, 4848,
+                   5000, 5432, 5672, 5900, 5901, 5984, 5985, 5986, 6000, 6379,
+                   7001, 7002, 8000, 8008, 8009, 8080, 8081, 8088, 8443, 8888,
+                   9000, 9042, 9090, 9092, 9200, 9300, 9418, 10000, 11211,
+                   15672, 27017, 27018, 50000, 50070, 61616]
+_SERVICIOS = {20: "ftp-data", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp",
+              53: "dns", 80: "http", 88: "kerberos", 110: "pop3", 111: "rpcbind",
+              135: "msrpc", 137: "netbios-ns", 138: "netbios-dgm", 139: "netbios-ssn",
+              143: "imap", 161: "snmp", 389: "ldap", 443: "https", 445: "smb",
+              464: "kpasswd", 587: "smtp-sub", 636: "ldaps", 873: "rsync",
+              993: "imaps", 995: "pop3s", 1080: "socks", 1099: "java-rmi",
+              1433: "mssql", 1521: "oracle", 2049: "nfs", 2375: "docker",
+              2376: "docker-tls", 3000: "node/gitea", 3306: "mysql", 3389: "rdp",
+              3690: "svn", 4444: "msf-handler", 5000: "upnp/flask", 5432: "postgres",
+              5672: "amqp", 5900: "vnc", 5901: "vnc", 5984: "couchdb",
+              5985: "winrm", 5986: "winrm-tls", 6379: "redis", 7001: "weblogic",
+              8080: "http-alt", 8081: "http-alt", 8443: "https-alt", 8888: "http-alt",
+              9000: "php-fpm", 9092: "kafka", 9200: "elasticsearch", 9300: "elasticsearch",
+              9418: "git", 11211: "memcached", 15672: "rabbitmq-mgmt",
+              27017: "mongodb", 27018: "mongodb", 50070: "hdfs", 61616: "activemq"}
 
 
 def ip_local():
@@ -80,6 +98,16 @@ def _probar(ip, puerto):
         s.close()
 
 
+def _ping(ip):
+    try:
+        r = subprocess.run(["ping", "-n", "1", "-w", "700", ip],
+                           capture_output=True, text=True,
+                           creationflags=CREATE_NO_WINDOW)
+        return r.returncode == 0
+    except Exception:
+        return True
+
+
 def escanear(objetivo, puertos="", progreso=None, usar_nmap=True):
     hosts = _expandir_objetivo(objetivo)
     lista_puertos = _expandir_puertos(puertos)
@@ -94,7 +122,7 @@ def escanear(objetivo, puertos="", progreso=None, usar_nmap=True):
     total = max(1, len(hosts))
     for i, ip in enumerate(hosts):
         abiertos = []
-        with ThreadPoolExecutor(max_workers=64) as ex:
+        with ThreadPoolExecutor(max_workers=128) as ex:
             for r in ex.map(lambda p: _probar(ip, p), lista_puertos):
                 if r:
                     abiertos.append(r)
@@ -111,8 +139,8 @@ def escanear(objetivo, puertos="", progreso=None, usar_nmap=True):
 
 def _escanear_nmap(objetivo, puertos, progreso):
     rango = ",".join(str(p) for p in puertos)
-    r = subprocess.run(["nmap", "-sV", "-Pn", "-p", rango, objetivo],
-                       capture_output=True, text=True)
+    r = subprocess.run(["nmap", "-sV", "-Pn", "--open", "-p", rango, objetivo],
+                       capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
     resultado = []
     ip_actual = None
     for linea in r.stdout.splitlines():

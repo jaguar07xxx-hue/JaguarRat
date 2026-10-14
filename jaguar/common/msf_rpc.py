@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
-"""msf_rpc.py — cliente mínimo de Metasploit RPC (msfrpcd) para JAGUAR.
-Requiere: pip install msgpack   (lado CONTROLADOR, no en la víctima)
+"""msf_rpc.py — cliente Metasploit RPC (msfrpcd) para JAGUAR.
+Requiere: pip install msgpack   (lado CONTROLADOR)
 
-Arranque del server Metasploit:
+Arranque del server:
     msfrpcd -P tu_clave -S -a 127.0.0.1 -p 55552
-
-Uso:
-    from jaguar.common.msf_rpc import MsfRpc
-    m = MsfRpc("127.0.0.1", 55552, "msf", "tu_clave"); m.login()
-    print(m.version()); print(m.sesiones())
 """
 import http.client
 import socket
@@ -24,7 +19,8 @@ class MsfError(Exception):
 
 
 class MsfRpc:
-    def __init__(self, host="127.0.0.1", port=55552, usuario="msf", password="", ssl=False):
+    def __init__(self, host="127.0.0.1", port=55552, usuario="msf",
+                 password="", ssl=False):
         if msgpack is None:
             raise MsfError("falta msgpack: pip install msgpack")
         self.host = host
@@ -33,13 +29,12 @@ class MsfRpc:
         self.password = password
         self.ssl = ssl
         self.token = None
-        self._ssl_auto = False   # tras el primer fallo, forzamos HTTPS
+        self._ssl_auto = False
 
-    # ---------------------------------------------------------------- conexión
     def _conexion(self, usar_ssl):
         if usar_ssl or self.ssl or self._ssl_auto:
-            return http.client.HTTPSConnection(self.host, self.port, timeout=30)
-        return http.client.HTTPConnection(self.host, self.port, timeout=30)
+            return http.client.HTTPSConnection(self.host, self.port, timeout=60)
+        return http.client.HTTPConnection(self.host, self.port, timeout=60)
 
     def _unpack(self, datos):
         try:
@@ -50,9 +45,7 @@ class MsfRpc:
     def _call(self, metodo, *args):
         peticion = [metodo, self.token] + list(args)
         cuerpo = msgpack.packb(peticion, use_bin_type=True)
-
         ultimo_error = None
-        # 1er intento: según configuración. 2do intento: forzar HTTP<->HTTPS.
         for intento in range(2):
             usar_ssl = self.ssl or self._ssl_auto
             try:
@@ -69,7 +62,6 @@ class MsfRpc:
                 except Exception:
                     resp = None
                 if not isinstance(resp, dict):
-                    # Habitualmente: se habló HTTP contra un puerto SSL (o al revés).
                     if intento == 0 and not usar_ssl:
                         self._ssl_auto = True
                         continue
@@ -82,7 +74,6 @@ class MsfRpc:
             except MsfError:
                 raise
             except (OSError, socket.timeout) as e:
-                # incluye ConnectionRefusedError, SSLError, timeout...
                 ultimo_error = MsfError(
                     f"servidor caído o puerto cerrado en {self.host}:{self.port} ({e})")
                 if intento == 0 and not usar_ssl:
@@ -107,20 +98,30 @@ class MsfRpc:
         return self._call("session.list")
 
     def modulos(self, tipo="exploit"):
-        """Lista módulos del tipo indicado (exploit/auxiliary/post/payload)."""
         metodo = {
             "exploit": "module.exploits",
             "auxiliary": "module.auxiliary",
             "post": "module.post",
             "payload": "module.payloads",
+            "encoder": "module.encoders",
+            "nop": "module.nops",
         }.get(tipo, "module.exploits")
         r = self._call(metodo)
         if isinstance(r, dict) and "modules" in r:
             return r["modules"]
         return r or []
 
+    def buscar(self, termino):
+        r = self._call("module.search", termino)
+        if isinstance(r, dict) and "modules" in r:
+            return r["modules"]
+        return r or []
+
     def info_modulo(self, tipo, nombre):
         return self._call("module.info", tipo, nombre)
+
+    def opciones_modulo(self, tipo, nombre):
+        return self._call("module.options", tipo, nombre)
 
     def ejecutar_modulo(self, tipo, nombre, opciones=None):
         return self._call("module.execute", tipo, nombre, opciones or {})
@@ -149,5 +150,5 @@ class MsfRpc:
     def consola_leer(self, cid):
         return self._call("console.read", cid)
 
-    def consola_listar(self):
-        return self._call("console.list")
+    def generar_payload(self, modulo_payload, opciones=None):
+        return self._call("module.execute", "payload", modulo_payload, opciones or {})

