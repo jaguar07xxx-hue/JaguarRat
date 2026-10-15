@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Servidor TCP Jaguar: escucha y crea una Sesión por cada agente que entra.
-Emite señales Qt para que la UI reaccione."""
+"""Servidor TCP Jaguar: escucha y crea una Sesión por cada agente que entra."""
 import socket
 import threading
 import uuid
@@ -45,6 +44,7 @@ class Servidor(QObject):
                 break
             try:
                 conn.settimeout(TIMEOUT_SOCKET)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # <- fluidez
             except Exception:
                 pass
             cid = uuid.uuid4().hex

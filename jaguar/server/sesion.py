@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Sesión de un agente: framing (4 bytes + payload CIFRADO) y ciclo de vida.
-Encaja EXACTO con Servidor:  Sesion(cid, conn, addr, servidor)."""
+"""Sesión de un agente: framing (4 bytes + payload CIFRADO) y ciclo de vida."""
 import json
 import socket
 import struct

