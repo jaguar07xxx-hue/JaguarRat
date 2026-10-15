@@ -1,3 +1,1 @@
- python -c "from jaguar.ui.logo import generar_ico; print(generar_ico())"
 
- python -c "from PyQt6.QtGui import QPixmap; p=QPixmap('jaguar/ui/jaguar.png'); print('OK' if not p.isNull() else 'NO CARGA', p.width(), p.height())" 
