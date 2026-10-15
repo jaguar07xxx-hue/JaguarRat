@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Escaneo de red/puertos con sockets (nmap opcional)."""
+"""Escaneo de red/puertos con sockets (nmap opcional). Multiplataforma."""
 import ipaddress
 import shutil
 import socket
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
+ES_WIN = sys.platform.startswith("win")
 CREATE_NO_WINDOW = 0x08000000
+
+
+def _sc():
+    return {"creationflags": CREATE_NO_WINDOW} if ES_WIN else {}
+
 
 PUERTOS_COMUNES = [20, 21, 22, 23, 25, 53, 67, 68, 69, 80, 88, 110, 111, 123,
                    135, 137, 138, 139, 143, 161, 389, 443, 445, 464, 500, 512,
@@ -99,10 +106,11 @@ def _probar(ip, puerto):
 
 
 def _ping(ip):
+    """Ping multiplataforma."""
+    cmd = (["ping", "-n", "1", "-w", "700", ip] if ES_WIN
+           else ["ping", "-c", "1", "-W", "1", ip])
     try:
-        r = subprocess.run(["ping", "-n", "1", "-w", "700", ip],
-                           capture_output=True, text=True,
-                           creationflags=CREATE_NO_WINDOW)
+        r = subprocess.run(cmd, capture_output=True, text=True, **_sc())
         return r.returncode == 0
     except Exception:
         return True
@@ -140,7 +148,7 @@ def escanear(objetivo, puertos="", progreso=None, usar_nmap=True):
 def _escanear_nmap(objetivo, puertos, progreso):
     rango = ",".join(str(p) for p in puertos)
     r = subprocess.run(["nmap", "-sV", "-Pn", "--open", "-p", rango, objetivo],
-                       capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+                       capture_output=True, text=True, **_sc())
     resultado = []
     ip_actual = None
     for linea in r.stdout.splitlines():

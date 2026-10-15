@@ -1,0 +1,42 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ---------- Build / dist ----------
+dist/
+build_jaguar/
+*.spec
+
+# ---------- Ofuscación ----------
+pyarmor_runtime_*/
+pyarmor_out/
+
+# ---------- Certificados ----------
+*.pfx
+*.p12
+*.key
+
+# ---------- Config local ----------
+.jaguar/
+
+# ---------- Salidas locales ----------
+JaguarScreenshots/
+*.old
+
+# ---------- Editores / SO ----------
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---------- Ejecutables ----------
+*.exe

