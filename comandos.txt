@@ -1,1 +1,7 @@
+sudo apt update
+sudo apt install -y aircrack-ng hcxtools hashcat reaver bully mdk4 iw \
+                    wpasupplicant hostapd dnsmasq net-tools python3-pyqt6
+git clone https://github.com/blunderbuss-wctf/wacker ~/wacker
+git clone https://github.com/jabbaw0nky/DragonShift ~/DragonShift
+sudo apt install -y wordlists && sudo gunzip -k /usr/share/wordlists/rockyou.txt.gz
 
