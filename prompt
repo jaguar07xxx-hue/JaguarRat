@@ -1,0 +1,397 @@
+repo (github.com/jaguar07xxx-hue/JaguarRat) 
+ "implementa todo y entrégame los archivos completos".
+ empiece por wifi_tab.py y main_window.py, y que entregue archivo por archivo (no todos de golpe) para que no se corte.
+# PRO
+MPT MAESTRO — Jaguar RAT v2.1: cadena autónoma Wi-Fi → LAN → Explotación → Sesión
+
+## 0. ROL Y MODO DE TRABAJO
+
+Actúa como **ingeniero senior full-stack + arquitecto de software + especialista en
+redes y seguridad ofensiva**. Escribes Python de producción, no bocetos.
+
+Reglas de trabajo:
+- Antes de escribir una sola línea, **investiga en al menos 4 fuentes independientes
+  y fiables** (documentación oficial, wikis de los proyectos, manuales de las
+  herramientas). Cita la fuente cuando tomes una decisión técnica.
+- Cuando termines de investigar, **escribe un plan corto** (qué ficheros tocas, en qué
+  orden, con qué estrategia) y luego entrega el código.
+- **Nada de pseudocódigo ni TODOs.** Todo implementado y funcional.
+- **Nada de suposiciones.** Si una API puede variar entre versiones, escribe el código
+  defensivo (try/except + fallback) y explica por qué.
+- Verifica mentalmente cada import, cada nombre de función y cada señal antes de
+  entregar. El objetivo declarado por el usuario es **cero errores**.
+
+## 1. CONTEXTO: EL PROYECTO
+
+- Repo: `https://github.com/jaguar07xxx-hue/JaguarRat` (rama `main`)
+- Es un **RAT / administrador remoto propio**, sin dependencia de Metasploit.
+- Controlador: **PyQt6** (Python 3.11–3.14; el entorno del usuario corre 3.14).
+- Agente: Python **autocontenido** (stdlib + PIL/cv2 opcionales), multiplataforma
+  Windows / Linux / macOS / Android-Termux.
+- Transporte: **TCP propio**, framing `[4 bytes big-endian de longitud][payload]`,
+  payload cifrado con PBKDF2-HMAC-SHA256 + keystream XOR + HMAC-SHA256.
+- **CRÍTICO: no toques el cifrado, el framing, la clave `_K_OBF`/`CLAVE_XOR_DEFECTO`
+  ni el handshake.** Son compatibles byte a byte entre agente y controlador y ya
+  funcionan. Cualquier cambio ahí rompe todo.
+
+### Estructura real del repo
+
+```
+run.py                                  # arranque del controlador
+requirements.txt
+DOCUMENTACION.md
+comandos.txt                            # script de instalación de herramientas
+agente/agente.py                        # payload (v4, 98 handlers, 38 movil_*)
+jaguar/__init__.py                      # FALTA
+jaguar/builder/__init__.py
+jaguar/builder/constructor.py           # builder: compila payload + genera droppers
+jaguar/common/__init__.py
+jaguar/common/constants.py              # constantes + clave + categorías de comando
+jaguar/common/cripto.py                 # cifrado (NO TOCAR)
+jaguar/common/protocolo.py              # framing auxiliar
+jaguar/common/config.py                 # config persistente ~/.jaguar/config.json
+jaguar/common/red.py                    # IP pública/local, validación LHOST
+jaguar/common/geo.py                    # geolocalización ip-api + bandera
+jaguar/common/escaner.py                # escaneo de red/puertos (socket + nmap opcional)
+jaguar/common/exploits.py               # registro de exploits puerto->CVE + recomendar()
+jaguar/common/explotadores.py           # explotadores nativos en Python puro
+jaguar/common/lateral.py                # movimiento lateral tipo Cobalt Strike
+jaguar/common/wifi.py                   # escaneo Wi-Fi básico (aircrack-ng)
+jaguar/common/wifi_ofensivo.py          # cadena 802.11 ofensiva COMPLETA (offline)
+jaguar/server/__init__.py               # FALTA
+jaguar/server/servidor.py               # servidor TCP, señales Qt
+jaguar/server/sesion.py                 # una sesión por agente
+jaguar/server/gestor_clientes.py        # registro de sesiones
+jaguar/ui/__init__.py                   # FALTA
+jaguar/ui/main_window.py                # ventana principal + todos los diálogos
+jaguar/ui/movil_dialog.py               # diálogo móvil Android (existe, mal integrado)
+jaguar/ui/theme.py                      # tema rojo/negro
+jaguar/ui/logo.py                       # logo/icono
+```
+
+### Estado actual — problemas YA conocidos (arréglalos también)
+
+1. `movil_dialog.py` está **huérfano**: `main_window.py` no lo importa, no existe
+   `movil_por_cid`, no hay acción de menú y `_on_mensaje_recibido` no enruta `movil_*`.
+   Además `_pintar_apps` usa `QListWidgetItem(str(p))` sin `addItem`.
+2. `lateral.lanzar()` con `tecnica="ssh"` lanza `NameError` por `url_payload_ssh`.
+3. `agente._cfg()` toma `--flags` como host; `_persistir()` en Linux ejecuta
+   `binario binario` cuando está congelado.
+4. `constructor.generar_sh()` usa `"$BIN" --version` para testear y **bloquea** (el
+   agente no soporta `--version`).
+5. Faltan `__init__.py` en `jaguar/`, `jaguar/server/`, `jaguar/ui/`.
+6. `wifi_ofensivo.py` (40 KB, cadena 802.11 completa) **no lo importa nadie**.
+
+## 2. OBJETIVO
+
+Convertir Jaguar en una herramienta **autónoma de extremo a extremo**: desde un
+portátil con un adaptador Wi-Fi, **sin necesitar ningún cliente ya conectado**, el
+operador debe poder:
+
+1. Escanear redes Wi-Fi cercanas.
+2. Elegir una red (WPA2, WPA3 o WPS indistintamente).
+3. Obtener la contraseña con las herramientas del sistema.
+4. **Conectarse** a esa red.
+5. Escanear los dispositivos de esa LAN.
+6. Elegir un dispositivo, escanearle puertos, ver recomendaciones de explotación y
+   lanzarlas.
+7. Conseguir una **sesión** (el agente aparece solo en el panel de clientes con su
+   IP, SO, usuario y país).
+8. Al hacer clic derecho sobre ese cliente, ver las funcionalidades **filtradas según
+   su sistema operativo**.
+
+Y **todo debe quedar conectado entre sí, sin errores, sin cuelgues y sin romper nada
+de lo que ya funciona.**
+
+## 3. REQUISITOS FUNCIONALES
+
+### Bloque A — Pestaña Wi-Fi (nueva)
+
+**RF1.** Crear una **pestaña permanente** llamada `📡 Wi-Fi` en la `QTabWidget`
+principal de `MainWindow` (no un diálogo modal), insertada entre `Escáner` y
+`Exploits`. El usuario debe poder dejarla abierta y ver el progreso.
+
+**RF2. Diagnóstico.** La pestaña arranca mostrando: backend detectado
+(`linux` / `wsl` / `windows`), resumen de herramientas presentes/ausentes
+(`wifi_ofensivo.resumen_herramientas()`, `esenciales_faltan()`) y el comando exacto
+para instalar lo que falta. En Linux, además avisa si no se corre como root.
+
+**RF3. Interfaz y modo monitor.** Combo con las interfaces inalámbricas
+(`wifi_ofensivo.interfaces()`), botón activar/desactivar monitor
+(`monitor_on` / `monitor_off` + `restaurar_red`) y refresco. Debe avisar si el
+adaptador no soporta monitor o inyección y ofrecer igualmente el modo solo-escucha.
+
+**RF4. Escaneo.** Escaneo de APs con segundos configurables y filtro de banda
+(2.4/5/6 GHz). Tabla ordenable con columnas: `ESSID`, `BSSID`, `Canal`, `Señal (dBm)`,
+`Seguridad`, `WPS`, `Banda`, `Recomendado`. La columna `Seguridad` debe clasificar
+**abierta / WEP / WPA2 / WPA2-WPA3 (transición) / WPA3-SAE / WPA3-OWE**. Doble clic
+sobre una fila la marca como objetivo.
+
+**RF5. Ataque (clientless cuando se pueda).** Orquestación automática en este orden,
+con log en vivo y parada manual:
+
+  a. **PMKID clientless** con `hcxdumptool` (no necesita ningún cliente conectado).
+  b. Si no hay PMKID en N segundos → **deauth + captura de handshake** con
+     `aireplay-ng` + `airodump-ng`.
+  c. Si el AP tiene **WPS activo** → **pixie dust** con `reaver -K 1` o `bully`.
+  d. Si es **WPA3 puro (SAE)** → `wacker` con `DragonShift` como fallback.
+  e. Si es **transición WPA2/WPA3** → tratar como WPA2 (a y b).
+
+**RF6. Crackeo.** Conversión con `hcxpcapngtool -o hash.22000` y crackeo con
+`hashcat -m 22000` usando la wordlist y las reglas elegidas. Debe mostrar progreso,
+tiempo estimado y la PSK al encontrarla. Si no hay GPU o `hashcat` falla, **fallback
+automático** a `aircrack-ng -w`. Combo de diccionarios alimentado por
+`wifi_ofensivo.diccionarios()` (rockyou, seclists…) más selector de fichero manual.
+
+**RF7. Conectar a la red.** Tras obtener la PSK, un botón `🔌 Conectar a esta red`
+ejecuta `wifi_ofensivo.conectar(iface, ssid, psk)`, espera DHCP, **verifica que hay
+IP** con `wifi_ofensivo.ip_de(iface)` y muestra el resultado. Si falla, restaura el
+estado anterior sin dejar la tarjeta rota.
+
+**RF8. Puente al Escáner.** Botón `➡ Enviar subred al Escáner` que toma
+`wifi_ofensivo.subred_de(iface)` (o `escaner.detectar_subred()`), **rellena el campo
+objetivo del tab Escáner** y opcionalmente lo lanza. Si ya existe un escaneo previo,
+preguntar si reemplazar.
+
+### Bloque B — Pestaña Escáner (ya existe, hay que completarla)
+
+**RF9.** Mantener el escaneo de hosts y el portscan actuales y **añadir**:
+  - Doble clic sobre un host → panel de detalle con sus puertos, servicio y banner.
+  - Botón `🎯 Recomendar exploits` que llame a `exploits.recomendar(escaneo, riesgo_minimo)`
+    y pinte una tabla con `IP`, `Puerto`, `Nombre`, `CVE`, `Riesgo`, `SO`, `Comando`.
+  - Botón `🔍 Verificar (nmap NSE)` → `exploits.comando_nmap(rec)`, muestra la salida.
+  - Botón `⚡ Explotar (nativo)` → `exploits.ejecutar_nativo(rec, lhost, lport)`; si el
+    puerto no tiene explotador nativo, deshabilitado con tooltip explicando por qué.
+  - Botón `🚀 Desplegar agente` → genera la cadena de `lateral.comando_completo(...)`
+    con la técnica elegida y la envía por el cliente pivote, **o** copia el comando al
+    portapapeles si no hay pivote.
+  - Nunca bloquear la GUI: todo en hilo con señales de progreso.
+
+### Bloque C — Panel de clientes y menú por SO
+
+**RF10.** Cuando un agente conecta, aparece en el árbol de clientes con `ID`, `Host`,
+`Usuario`, `SO`, `IP`, `País`, `ISP` (ya existe). Añadir: columna de **arquitectura**
+y un **filtro/orden por SO** en la barra superior.
+
+**RF11. Menú contextual filtrado por SO.** Reescribir `_menu_contexto(cid)` para
+construir el menú **según `info["plataforma"]` y `info["caps"]`**:
+
+  - **Windows**: Terminal, Escritorio remoto, HVNC, Webcam, Keylogger, Portapapeles,
+    Ratón/teclado, Procesos, Servicios, Persistencia, Stealer, Perfiles Wi-Fi,
+    UAC/privilegios, Energía, Desconectar.
+  - **Linux / macOS**: Terminal, Captura, Keylogger, Persistencia (systemd/cron),
+    Procesos, Portapapeles, Explorador, Descargar/Subir, Energía, Desconectar.
+  - **Android**: Móvil (abre `MovilDialog`), Captura, Shell, Notificaciones,
+    Ubicación, Sensores, SMS, Apps, Persistencia Termux:Boot, Desconectar.
+  - Lo que el agente no soporte (`caps`), **no se muestra** en lugar de fallar al
+    pulsarlo.
+  - Deja también un grupo `Genérico` con lo que aplica a todos.
+
+**RF12.** Arreglar e integrar `MovilDialog` de verdad: import, `self.movil_por_cid`,
+acción de menú, y **enrutado de todas las respuestas `movil_*`** en
+`_on_mensaje_recibido` hacia `dlg._sig_pantalla` / `dlg._sig_camara` / `dlg._sig_datos`.
+Corregir `_pintar_apps` (`addItem`). El enrutado va **antes** del log genérico.
+
+## 4. ARQUITECTURA OBLIGATORIA
+
+- `jaguar/common/wifi_ofensivo.py` es el **backend**. La UI **no** llama a
+  `subprocess` de Wi-Fi directamente: solo orquesta funciones de ese módulo.
+- Nueva UI aislada: **`jaguar/ui/wifi_tab.py`** con una clase
+  `PanelWifi(QWidget)`. Expone señales Qt y un método `enviar_subred()` /
+  señal `subred_lista(str)`. `MainWindow` solo la instancia, la añade como pestaña y
+  conecta la señal al tab Escáner.
+- **Hilos**: toda operación >200 ms va en `threading.Thread(daemon=True)`. La UI se
+  actualiza **solo** desde el hilo principal mediante `pyqtSignal`. Regla estricta:
+  **jamás tocar un widget desde un hilo worker**. Usa señales dedicadas
+  (`_sig_log`, `_sig_aps`, `_sig_progreso`, `_sig_fin`, `_sig_ifaces`, `_sig_words`).
+- Un flag `self._ocupado` que deshabilita botones durante operaciones largas y un
+  botón `⏹ Cancelar` que setea un `threading.Event` de parada que el worker consulta.
+- **Logging**: todo lo que ejecuta un binario externo se registra (comando + salida
+  recortada) en el panel de log del tab, con marca de tiempo.
+- Reutiliza el tema (`jaguar.ui.theme.aplicar_tema_rojo_negro`, `ESTILO_BOTON`) y los
+  patrones visuales ya usados en el resto de la app.
+- Comentarios y docstrings **en español**, mismo estilo que el resto del proyecto.
+
+## 5. API EXISTENTE QUE DEBES USAR (no reinventes)
+
+```python
+# jaguar/common/wifi_ofensivo.py
+backend() -> str                          # 'linux' | 'wsl' | 'windows'
+herramientas() -> dict                    # {bin: {"ok","ruta","uso"}}
+faltantes() -> list[str]; esenciales_faltan() -> list[str]; hay_stack() -> bool
+resumen_herramientas() -> str; diagnostico() -> str; diccionarios() -> list[str]
+interfaces() -> list[str]; listar_monitores() -> list[str]
+monitor_on(iface) -> str|None; monitor_off(mon=None, base=None) -> str
+restaurar_red(iface=None); es_monitor(iface) -> bool
+ip_de(iface) -> str; subred_de(iface) -> str
+escanear(iface, segundos=15, banda=None) -> list[dict]
+    # dicts con: bssid, canal, senal, cifrado, auth, essid, wps, banda,
+    #            wpa3, wpa2, wep, abierta, transicion, seguridad, recomendado
+mejor_ap(aps, solo_cifradas=True) -> dict|None
+capturar_pmkid(mon, bssid, canal, segundos=25) -> str
+deauth(mon, bssid, veces=5, cliente=None)
+convertir(captura) -> (ruta, msg)
+crackear(hash22000, wordlist, log=None, timeout=1800, reglas=None) -> (psk, metodo)
+wps_escanear(mon, segundos=14) -> list[dict]
+wps_comando(tecnica, mon, bssid, canal, pin=""); correr_wps(cmd, log=None, timeout=600)
+wpa3_wacker(iface, ssid, bssid, wordlist, ruta=None, log=None, timeout=1200)
+mdk4(mon, modo="a", segundos=60, extra=None, log=None)
+dragonshift(ruta=None, log=None, timeout=1800)
+evil_twin(iface, ssid, canal, salida="", segundos=120, log=None) -> str
+conectar(iface, ssid, psk) -> str
+auto_atacar(mon, iface, ap, wordlist, log=None, segundos_pmkid=25) -> (psk, informe)
+
+# jaguar/common/escaner.py
+escanear(objetivo, puertos="", progreso=None, usar_nmap=True) -> list[dict]
+ip_local() -> str; detectar_subred() -> str; PUERTOS_COMUNES -> list[int]
+
+# jaguar/common/exploits.py
+recomendar(escaneo, riesgo_minimo=None) -> list[dict]   # ip,puerto,nombre,cve,riesgo,so,cmd,nativo
+comando_para(rec) -> str; comando_nmap(rec) -> str
+tiene_nativo(puerto) -> bool
+ejecutar_nativo(rec, lhost="", lport=0) -> explotadores.Resultado
+puertos_soportados() -> list[int]
+
+# jaguar/common/explotadores.py
+explotar(ip, puerto, lhost="", lport=0, comando=None, **extra) -> Resultado
+Resultado(ok, salida, error, metodo); MAPA; soportado(puerto)
+metasploit_disponible(); comando_metasploit(rec, lhost, lport)
+
+# jaguar/common/lateral.py
+TECNICAS; INFO; url_payload(host, puerto_http, nombre_exe)
+comando_completo(tecnica, target, url, exe="Jaguar.exe", servicio="JaguarSvc", usuario="", password="")
+limpiar(tecnica, target, servicio)
+
+# jaguar/common/wifi.py  (backend simple, ya usado por el botón actual)
+hay_aircrack() -> bool; interfaces() -> list[str]
+poner_monitor(iface) -> str|None; quitar_monitor(mon); escanear(mon, segundos) -> list[dict]
+```
+
+Del agente (`agente/agente.py`) los handlers relevantes son `shell`, `portscan`,
+`sysinfo`, `spawn`, `persistir`, `privilegios`, `wifi_perfiles`, y todos los `movil_*`.
+
+## 6. FICHEROS A CREAR Y A MODIFICAR
+
+**CREAR**
+- `jaguar/__init__.py`, `jaguar/server/__init__.py`, `jaguar/ui/__init__.py` (vacíos)
+- `jaguar/ui/wifi_tab.py` → `PanelWifi(QWidget)`
+- `jaguar/ui/exploit_panel.py` → opcional, si prefieres separar el panel de
+  recomendaciones del tab Escáner (justifícalo)
+
+**MODIFICAR**
+- `jaguar/ui/main_window.py` → pestaña Wi-Fi, puente subred→escáner, panel de
+  recomendaciones, menú contextual por SO, integración de `MovilDialog`, columna de
+  arquitectura, filtro por SO
+- `jaguar/ui/movil_dialog.py` → fix de `_pintar_apps` + robustez
+- `jaguar/common/lateral.py` → fix del `NameError` de `ssh`
+- `jaguar/common/escaner.py` → soportar rangos `a.b.c.d-a.b.c.e`
+- `jaguar/common/constants.py` → `FORMATOS_PAYLOAD` real
+- `jaguar/builder/constructor.py` → solo `generar_sh()`
+- `agente/agente.py` → solo `_cfg()`, `_invocador()` (nueva) y `_persistir()`
+- `DOCUMENTACION.md` → nueva sección "Cadena Wi-Fi → sesión"
+
+**NO TOCAR**: `cripto.py`, `protocolo.py`, `sesion.py`, `servidor.py`, `theme.py`,
+`logo.py`, el diccionario `HANDLERS` del agente.
+
+## 7. INVESTIGACIÓN OBLIGATORIA
+
+Antes de codificar, consulta y **cita** al menos estas fuentes:
+
+- `aircrack-ng` (airmon-ng, airodump-ng, aireplay-ng, aircrack-ng): modo monitor,
+  deauth, captura de handshake, crackeo CPU.
+- `hcxtools` / `hcxdumptool` (ZerBea) y `hcxpcapngtool`: ataque **PMKID clientless**,
+  formato `hash.22000`, versiones mínimas.
+- `hashcat` modo `22000` (WPA-PBKDF2-PMKID+EAPOL) y reglas.
+- `wacker` (blunderbuss-wctf) y `DragonShift` (jabbaw0nky): **WPA3 / SAE**.
+- `reaver`, `wash`, `bully`, `pixiewps`: WPS y pixie dust.
+- `mdk4`: modos `a`/`f` (deauth masivo, FragAttacks).
+- `hostapd` + `dnsmasq` + `wpa_supplicant` + `dhclient` + `nmcli`: evil twin y
+  conexión a la red.
+- `usbipd-win` + WSL2: cómo pasar un adaptador USB a WSL2 (Windows sin adaptador
+  nativo en Linux).
+- `PyQt6`: `pyqtSignal`/`pyqtSlot`, `QThread` vs `threading`, conexiones
+  `QueuedConnection`, seguridad de hilos al tocar widgets.
+- `nmap` NSE (`smb-vuln-ms17-010`, `rdp-ntlm-info`, `ms-sql-info`, `vnc-info`,
+  `redis-info`, `mongodb-info`, `snmp-info`, `rsync-list-modules`): verificación.
+- Documentación de **Cobalt Strike** sobre `jump` / `remote-exec` para validar las
+  técnicas de `lateral.py`.
+
+Documenta en un comentario de cabecera de `wifi_tab.py` las **versiones mínimas**
+requeridas de cada binario y las **limitaciones conocidas**.
+
+## 8. CASOS LÍMITE Y TRAMPAS QUE DEBES RESOLVER
+
+1. **Adaptador sin monitor o sin inyección** → detectar y degradar a escaneo pasivo;
+   avisar claro, no fallar.
+2. **Banda 6 GHz** → soporte si el adaptador lo permite; si no, filtrar.
+3. **WPA3 puro (SAE)** → no hay PMKID ni handshake clásico: ir directo a `wacker`.
+4. **Transición WPA2/WPA3** → tratar como WPA2 (PMKID/handshake funcionan).
+5. **PMKID no disponible** (AP viejo) → fallback obligatorio a deauth+handshake.
+6. **NetworkManager peleando con la tarjeta** → `airmon-ng check kill` o
+   `nmcli device set <if> managed no` antes de monitorizar, y restaurar al salir.
+7. **Sin root** → avisar y explicar; algunas operaciones seguirán funcionando.
+8. **Sin GPU / `hashcat` falla** → fallback a `aircrack-ng -w`.
+9. **WSL2** → rutas de dispositivos, `usbipd`, ausencia de `airmon-ng` nativo: usar el
+   backend `wsl` de `wifi_ofensivo` y traducir rutas `/mnt/c/...`.
+10. **Procesos zombie** → matar `airodump-ng`/`hcxdumptool`/`hashcat` al cancelar y al
+    cerrar la pestaña (`closeEvent`).
+11. **Rutas con espacios** → citar siempre en los comandos de shell.
+12. **Qt + hilos** → prohibido tocar widgets desde el worker; usar señales.
+13. **La pestaña Wi-Fi y el diálogo Móvil deben convivir** sin pisarse timers ni
+    estados globales.
+14. **Idempotencia** → activar monitor dos veces, o conectar dos veces, no debe romper.
+15. **`_on_mensaje_recibido`** debe enrutar `movil_*` antes del log genérico, y
+    `recon_full` debe estar en `CMDS_RECON`.
+
+## 9. FORMATO DE ENTREGA (ESTRICTO)
+
+- Entrega **archivos completos**, no diffs ni fragmentos.
+- Antes de cada archivo: una línea con su **ruta exacta** y si es `NUEVO` o
+  `REEMPLAZA`.
+- Bloques de código listos para **copiar y pegar** sin editar nada.
+- Docstrings y comentarios **en español**.
+- Si un archivo es enorme (`main_window.py`, `agente.py`), entrega el **archivo
+  completo** igualmente; si te quedas sin espacio, pártelo en varios mensajes y dilo.
+- Al final, un **checklist de verificación** con comandos concretos:
+
+```bash
+python -m compileall -q jaguar agente run.py && echo OK
+python -c "import jaguar.ui.main_window, jaguar.ui.wifi_tab; print('imports OK')"
+python run.py
+```
+
+- Y una tabla `requisito → fichero → función` que demuestre que RF1…RF12 están cubiertos.
+
+## 10. CRITERIOS DE ACEPTACIÓN
+
+1. `python run.py` arranca sin excepciones y sin warnings de imports.
+2. Existe una pestaña `📡 Wi-Fi` funcional y persistente.
+3. Con un adaptador en monitor, se listan APs reales con seguridad clasificada.
+4. Se puede atacar un AP y llegar a la PSK, con log de cada paso.
+5. Se puede conectar a la red y el botón de subred rellena el Escáner.
+6. El Escáner lista hosts y puertos; las recomendaciones salen con CVE y riesgo.
+7. `Explotar (nativo)` y `Verificar (NSE)` producen salida visible.
+8. Al desplegar el agente, el cliente **aparece solo** en el panel con su SO.
+9. El clic derecho muestra **solo** lo aplicable a ese SO.
+10. Con un cliente Android, `📱 Móvil` abre el diálogo y responde a los comandos.
+11. Ninguna operación congela la ventana.
+12. Cerrar cualquier pestaña/diálogo no deja procesos hijos ni hilos vivos.
+
+## 11. PROHIBIDO
+
+- Cambiar cifrado, framing, clave o handshake.
+- Añadir dependencias pesadas (nada de frameworks nuevos).
+- Requerir Metasploit (solo puente opcional).
+- Bloquear el hilo de la GUI.
+- Tocar widgets desde hilos worker.
+- Inventar rutas de ficheros o URLs.
+- Dejar `TODO`, `pass` sin implementar o funciones vacías.
+- Romper el flujo actual (escáner, stealer, HVNC, webcam, builder, móvil).
+
+## 12. EMPIEZA ASÍ
+
+Responde primero con:
+1. **Plan** de implementación en 10 líneas (orden de ficheros).
+2.. **Primer archivo completo**: `jaguar/ui/wifi_tab.py`.
+
+Luego continúa archivo por archivo hasta terminar.

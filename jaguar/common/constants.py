@@ -62,5 +62,7 @@ CMD_STEALER_PAQUETE = "stealer_paquete"
 CMD_STEALER_EXFIL = "stealer_exfil"
 CMD_STEALER_AUTO = "stealer_auto"
 
-# Builder
-FORMATOS_PAYLOAD = ["py", "exe", "doc", "lnk", "ps1", "vbs", "bat", "hta"]
+# Builder (lo que el constructor sabe generar de verdad)
+FORMATOS_PAYLOAD = ["py", "sh", "exe", "desktop", "command", "android",
+                    "bat", "vbs", "ps1", "lnk", "hta", "pdf", "png",
+                    "png_stego", "macro"]

