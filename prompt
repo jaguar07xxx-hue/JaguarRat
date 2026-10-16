@@ -2,7 +2,7 @@ repo (github.com/jaguar07xxx-hue/JaguarRat)
  "implementa todo y entrégame los archivos completos".
  empiece por wifi_tab.py y main_window.py, y que entregue archivo por archivo (no todos de golpe) para que no se corte.
 # PRO
-MPT MAESTRO — Jaguar RAT v2.1: cadena autónoma Wi-Fi → LAN → Explotación → Sesión
+MPT MAESTRO — Jaguar RAT v2.1: cadena autónoma Wi-Fi → LAN - WAN NAT → Explotación → Sesión
 
 ## 0. ROL Y MODO DE TRABAJO
 
@@ -376,6 +376,8 @@ python run.py
 10. Con un cliente Android, `📱 Móvil` abre el diálogo y responde a los comandos.
 11. Ninguna operación congela la ventana.
 12. Cerrar cualquier pestaña/diálogo no deja procesos hijos ni hilos vivos.
+13, que en la pestaña beacons funcione con tdodo los beacons que se pueda implementar avanzados que funcione si hay clientes activos los liste para solo escojer y lanzar los beacons y si genera secion aparezca en cliente o si es mejor que aparexca en una panel aparte de beacons para seguir operando , la idea es poder hacer postesplotacion y movimientos laterales o pivoting lo que sea mejor
+
 
 ## 11. PROHIBIDO
 
@@ -386,7 +388,7 @@ python run.py
 - Tocar widgets desde hilos worker.
 - Inventar rutas de ficheros o URLs.
 - Dejar `TODO`, `pass` sin implementar o funciones vacías.
-- Romper el flujo actual (escáner, stealer, HVNC, webcam, builder, móvil).
+- Romper el flujo actual (escáner,beacons. lateal, stealer, HVNC, webcam, builder, móvil).
 
 ## 12. EMPIEZA ASÍ
 

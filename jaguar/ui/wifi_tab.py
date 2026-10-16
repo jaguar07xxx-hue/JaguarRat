@@ -33,21 +33,21 @@ ARQUITECTURA (reglas duras, no negociables)
 --------------------------------------------------------------------------
 VERSIONES MÍNIMAS DE LOS BINARIOS EXTERNOS
 --------------------------------------------------------------------------
-  aircrack-ng   >= 1.6      airmon-ng, airodump-ng, aireplay-ng, aircrack-ng
-                            (modo monitor, deauth, captura, crackeo CPU)
-  hcxtools      >= 6.0.0    hcxdumptool, hcxpcapngtool  (PMKID clientless,
-                            conversión a hashcat -m 22000)
-  hashcat       >= 6.2.6    modo 22000 (WPA-PBKDF2-PMKID+EAPOL)
-  reaver        >= 1.6.5    WPS + pixiewps (`-K 1`)
-  bully         >= 0.7      alternativa a reaver para WPS
-  wacker        >= 1.0      ataque WPA3-SAE (blunderbuss-wctf/wacker)
-  DragonShift   >= 0.2      downgrade WPA3 transition-mode (Dragonblood)
-  mdk4          >= 4.2      deauth masivo (modo a) y FragAttacks (modo f)
-  hostapd       >= 2.9      evil twin
-  dnsmasq       >= 2.80     DHCP/DNS del evil twin
-  wpa_supplicant>= 2.9      conexión a la red
-  dhclient      >= 4.4      DHCP cliente (fallback: nmcli / udhcpc)
-  nmcli (NM)    >= 1.30     alternativa de conexión en escritorios Linux
+  aircrack-ng    >= 1.6      airmon-ng, airodump-ng, aireplay-ng, aircrack-ng
+                             (modo monitor, deauth, captura, crackeo CPU)
+  hcxtools       >= 6.0.0    hcxdumptool, hcxpcapngtool  (PMKID clientless,
+                             conversión a hashcat -m 22000)
+  hashcat        >= 6.2.6    modo 22000 (WPA-PBKDF2-PMKID+EAPOL)
+  reaver         >= 1.6.5    WPS + pixiewps (`-K 1`)
+  bully          >= 0.7      alternativa a reaver para WPS
+  wacker         >= 1.0      ataque WPA3-SAE (blunderbuss-wctf/wacker)
+  DragonShift    >= 0.2      downgrade WPA3 transition-mode (Dragonblood)
+  mdk4           >= 4.2      deauth masivo (modo a) y FragAttacks (modo f)
+  hostapd        >= 2.9      evil twin
+  dnsmasq        >= 2.80     DHCP/DNS del evil twin
+  wpa_supplicant >= 2.9      conexión a la red
+  dhclient       >= 4.4      DHCP cliente (fallback: nmcli / udhcpc)
+  nmcli (NM)     >= 1.30     alternativa de conexión en escritorios Linux
 
 --------------------------------------------------------------------------
 LIMITACIONES CONOCIDAS
@@ -89,6 +89,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -103,7 +104,6 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
-    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -152,7 +152,7 @@ C_VERDE = "#38d67f"
 C_AMBAR = "#ffb020"
 C_AZUL = "#5fa8ff"
 
-# Colores por clasificación de seguridad del AP.
+# Colores por clasificación CANÓNICA de seguridad del AP (ver _norm_seguridad).
 _COLOR_SEGURIDAD = {
     "abierta": C_GRIS,
     "WEP": C_AMBAR,
@@ -214,6 +214,40 @@ def _q(ruta: str) -> str:
     return '"%s"' % ruta.replace('"', '\\"')
 
 
+def _norm_seguridad(ap: dict) -> str:
+    """Normaliza la clasificación de seguridad a las etiquetas canónicas que
+    usa la columna Seguridad (RF4):
+
+        abierta | WEP | WPA2 | WPA2-WPA3 | WPA3-SAE | WPA3-OWE
+
+    El backend puede devolver variantes ("WPA2-PSK", "WPA3 (transicion)",
+    "ABIERTA"...), así que aquí se unifican. Se escribe defensivo: si el
+    backend añade campos nuevos, se siguen usando como pistas.
+    """
+    seg = str(ap.get("seguridad") or "").strip()
+    texto = " ".join(str(ap.get(k) or "") for k in
+                     ("cifrado", "auth", "seguridad", "key_mgmt")).upper()
+
+    if ap.get("abierta") or "ABIERTA" in texto or "OPEN" in texto:
+        if "OWE" in texto or "ENHANCED OPEN" in texto:
+            return "WPA3-OWE"
+        return "abierta"
+    if ap.get("wep") or "WEP" in texto:
+        return "WEP"
+    if "OWE" in texto or "ENHANCED OPEN" in texto:
+        return "WPA3-OWE"
+
+    sae = bool(ap.get("wpa3")) or ("SAE" in texto) or ("WPA3" in texto)
+    wpa2 = bool(ap.get("wpa2")) or ("WPA2" in texto) or ("PSK" in texto)
+    if ap.get("transicion") or (sae and wpa2):
+        return "WPA2-WPA3"
+    if sae:
+        return "WPA3-SAE"
+    if wpa2:
+        return "WPA2"
+    return seg or "desconocida"
+
+
 class PanelWifi(QWidget):
     """Pestaña Wi-Fi completa: diagnóstico, monitor, escaneo, ataque,
     crackeo, conexión y puente hacia la pestaña Escáner.
@@ -253,6 +287,7 @@ class PanelWifi(QWidget):
         self._parar = threading.Event()
         self._hilo: threading.Thread | None = None
         self._ultima_captura: str = ""
+        self._ultima_subred: str = ""
 
         # Callback de log para el backend. Se emite como señal porque lo
         # invoca el hilo worker.
@@ -305,7 +340,7 @@ class PanelWifi(QWidget):
         lay_if = QGridLayout(g_if)
         self.cmb_iface = QComboBox()
         self.cmb_iface.setMinimumWidth(160)
-        self.cmb_iface.currentTextChanged.connect(self._on_iface_cambiada)
+        self.cmb_iface.currentIndexChanged.connect(self._on_iface_cambiada)
         self.btn_refrescar_if = QPushButton("🔄")
         self.btn_refrescar_if.setToolTip("Refrescar lista de interfaces")
         self.btn_refrescar_if.clicked.connect(self._refrescar_ifaces)
@@ -345,12 +380,15 @@ class PanelWifi(QWidget):
         self.btn_cancelar.setToolTip(
             "Solicita parada y mata los procesos hijos.")
         self.btn_cancelar.clicked.connect(self._op_cancelar)
+        self.lbl_modo = QLabel("modo: monitor")
+        self.lbl_modo.setStyleSheet("color:%s;" % C_GRIS)
         lay_sc.addWidget(QLabel("Duración:"), 0, 0)
         lay_sc.addWidget(self.sp_segundos, 0, 1)
         lay_sc.addWidget(QLabel("Banda:"), 0, 2)
         lay_sc.addWidget(self.cmb_banda, 0, 3)
         lay_sc.addWidget(self.btn_escanear, 1, 0, 1, 2)
         lay_sc.addWidget(self.btn_cancelar, 1, 2, 1, 2)
+        lay_sc.addWidget(self.lbl_modo, 2, 0, 1, 4)
 
         fila_sup.addWidget(g_if, 1)
         fila_sup.addWidget(g_scan, 1)
@@ -601,13 +639,15 @@ class PanelWifi(QWidget):
             return
         self._log("⏹ Cancelación solicitada para '%s'…" % self._clave_activa)
         self._parar.set()
-        self._matar_procesos()
+        # pkill/taskkill es rápido, pero no bloquea la GUI de forma notable;
+        # se lanza en un hilo para no arriesgar el repintado.
+        threading.Thread(target=self._matar_procesos, daemon=True).start()
 
     def _matar_procesos(self) -> None:
         """Mata binarios 802.11 huérfanos. Nunca lanza excepción."""
         # 1) Si el backend expone su propia limpieza, se usa.
         if wof is not None:
-            for nombre in ("limpiar_procesos", "matar_todo", "limpiar"):
+            for nombre in ("limpiar_procesos", "matar_todo"):
                 fn = getattr(wof, nombre, None)
                 if callable(fn):
                     try:
@@ -615,7 +655,8 @@ class PanelWifi(QWidget):
                         return
                     except Exception:
                         pass
-        # 2) Fallback genérico.
+        # 2) Fallback genérico (nunca `limpiar`, que en wifi_ofensivo borra
+        #    ficheros temporales y no procesos).
         try:
             if os.name == "nt":
                 for b in _BINS_A_MATAR:
@@ -627,7 +668,7 @@ class PanelWifi(QWidget):
                         subprocess.run(["pkill", "-f", b],
                                        capture_output=True, check=False)
         except Exception as exc:
-            self._log("⚠ Limpieza de procesos: %s" % exc)
+            self._sig_log.emit("⚠ Limpieza de procesos: %s" % exc)
 
     def detener(self) -> None:
         """Llamado por MainWindow al cerrar la app (la pestaña no tiene
@@ -656,7 +697,7 @@ class PanelWifi(QWidget):
             self.progreso.setRange(0, 100)
             self.progreso.setValue(min(100, pct))
         if txt:
-            self.progreso.setFormat("%s  (%p%)" % txt)
+            self.progreso.setFormat("%s  (%p%%)" % txt)
 
     def _on_resultado(self, clave: str, texto: str) -> None:
         """Resultados con carga semántica (se ejecuta en el hilo GUI)."""
@@ -800,7 +841,6 @@ class PanelWifi(QWidget):
         if not cmd:
             self._log("ℹ No falta ningún paquete conocido.")
             return
-        from PyQt6.QtWidgets import QApplication
         QApplication.clipboard().setText(cmd)
         self._log("📋 Copiado: %s" % cmd)
 
@@ -816,7 +856,7 @@ class PanelWifi(QWidget):
         try:
             ifaces = list(wof.interfaces() or [])
         except Exception as exc:
-            self._log("⚠ interfaces(): %s" % exc)
+            self._sig_log.emit("⚠ interfaces(): %s" % exc)
             ifaces = []
         monitores = []
         try:
@@ -826,7 +866,7 @@ class PanelWifi(QWidget):
         self._sig_ifaces.emit(ifaces + [("MON::" + m) for m in monitores])
 
     def _on_ifaces(self, lista: list) -> None:
-        prev = self.cmb_iface.currentText()
+        prev = self.cmb_iface.currentData()
         self.cmb_iface.blockSignals(True)
         self.cmb_iface.clear()
         for it in lista:
@@ -836,17 +876,19 @@ class PanelWifi(QWidget):
                 self.cmb_iface.addItem(str(it), str(it))
         self.cmb_iface.blockSignals(False)
         if prev:
-            idx = self.cmb_iface.findText(prev)
+            idx = self.cmb_iface.findData(prev)
             if idx >= 0:
                 self.cmb_iface.setCurrentIndex(idx)
-        self._on_iface_cambiada(self.cmb_iface.currentText())
+        self._on_iface_cambiada(self.cmb_iface.currentIndex())
         self._refrescar_botones()
         self._log("📶 Interfaces detectadas: %d" % self.cmb_iface.count())
 
-    def _on_iface_cambiada(self, _txt: str) -> None:
+    def _on_iface_cambiada(self, _idx: int) -> None:
         self._iface_actual = self.cmb_iface.currentData() or ""
         self._mon_actual = None
         self._modo_solo_escucha = False
+        self.lbl_modo.setText("modo: monitor")
+        self.lbl_modo.setStyleSheet("color:%s;" % C_GRIS)
         self._refrescar_botones()
 
     def _op_monitor_on(self) -> None:
@@ -862,6 +904,7 @@ class PanelWifi(QWidget):
                     self._sig_resultado.emit("monitor",
                                              "Ya estaba en monitor: %s" % iface)
                     self._mon_actual = iface
+                    self._sig_resultado.emit("ip", "monitor idempotente")
                     return
             except Exception:
                 pass
@@ -940,7 +983,7 @@ class PanelWifi(QWidget):
         self.tabla.setRowCount(0)
         self._aps = []
         for idx, ap in enumerate(aps):
-            seg = str(ap.get("seguridad") or "desconocida")
+            seg = _norm_seguridad(ap)
             fila = self.tabla.rowCount()
             self.tabla.insertRow(fila)
 
@@ -948,7 +991,8 @@ class PanelWifi(QWidget):
                              color=C_TEXTO, negrita=True, dato=idx)
             if ap.get("recomendado"):
                 it0.setText("★ " + it0.text())
-                it0.setToolTip("AP recomendado por el backend.")
+                it0.setToolTip("AP recomendado por el backend: %s"
+                               % ap.get("recomendado"))
             self.tabla.setItem(fila, 0, it0)
 
             self.tabla.setItem(fila, 1, self._item(
@@ -1031,10 +1075,10 @@ class PanelWifi(QWidget):
         self.lbl_objetivo.setText(
             "Objetivo: <b>%s</b> · %s · canal %s · %s"
             % (ap.get("essid") or "<oculto>", ap.get("bssid"),
-               ap.get("canal"), ap.get("seguridad")))
+               ap.get("canal"), _norm_seguridad(ap)))
         self.txt_ssid.setText(str(ap.get("essid") or ""))
         self._log("🎯 Objetivo marcado: %s (%s) %s"
-                  % (ap.get("essid"), ap.get("bssid"), ap.get("seguridad")))
+                  % (ap.get("essid"), ap.get("bssid"), _norm_seguridad(ap)))
         self._refrescar_botones()
 
     # =====================================================================
@@ -1052,16 +1096,25 @@ class PanelWifi(QWidget):
         iface = self._iface_actual
         ap = dict(self._objetivo)
         segundos_pmkid = int(self.sp_pmkid.value())
+        seg = _norm_seguridad(ap)
 
         def tarea():
             self._sig_log.emit("⚔ Iniciando cadena automática sobre %s (%s)"
                                % (ap.get("essid"), ap.get("bssid")))
-            if str(ap.get("seguridad")) == "WPA3-SAE":
+            # Orden declarado de la cadena (RF5): a) PMKID clientless
+            # b) deauth+handshake  c) WPS pixie-dust  d) WPA3 → wacker
+            # e) transición → como WPA2. El orden real lo aplica el backend
+            # en auto_atacar(), aquí solo se informa.
+            if seg == "WPA3-SAE":
                 self._sig_log.emit(
-                    "ℹ WPA3-SAE puro: sin PMKID ni handshake clásico.")
-            elif ap.get("transicion"):
+                    "ℹ WPA3-SAE puro: sin PMKID ni handshake clásico; "
+                    "el backend irá a wacker.")
+            elif seg == "WPA2-WPA3":
                 self._sig_log.emit(
                     "ℹ Modo transición WPA2/WPA3: se trata como WPA2.")
+            elif ap.get("wps"):
+                self._sig_log.emit("ℹ WPS activo: el backend intenta "
+                                   "pixie-dust primero.")
             psk, informe = wof.auto_atacar(
                 mon, iface, ap, wl, log=self._log_cb,
                 segundos_pmkid=segundos_pmkid)
@@ -1335,14 +1388,14 @@ class PanelWifi(QWidget):
         self._sig_words.emit(words)
 
     def _on_words(self, words: list) -> None:
-        prev = self.cmb_wordlist.currentText()
+        prev = self.cmb_wordlist.currentData()
         self.cmb_wordlist.clear()
         for w in words:
             self.cmb_wordlist.addItem(os.path.basename(w), w)
         if not words:
             self.cmb_wordlist.addItem("(sin diccionarios)", "")
         if prev:
-            idx = self.cmb_wordlist.findText(prev)
+            idx = self.cmb_wordlist.findData(prev)
             if idx >= 0:
                 self.cmb_wordlist.setCurrentIndex(idx)
 
@@ -1401,6 +1454,11 @@ class PanelWifi(QWidget):
         if not hay_obj:
             self.btn_atacar.setToolTip("Marca un AP objetivo primero.")
             self.btn_wacker.setToolTip("Marca un AP objetivo primero.")
+        self.lbl_modo.setText(
+            "modo: solo-escucha (sin monitor)"
+            if self._modo_solo_escucha else
+            ("modo: monitor (%s)" % self._mon_actual if hay_mon
+             else "modo: monitor"))
 
     # =====================================================================
     # API PÚBLICA PARA MainWindow
@@ -1413,7 +1471,7 @@ class PanelWifi(QWidget):
 
     @property
     def ultima_subred(self) -> str:
-        return getattr(self, "_ultima_subred", "")
+        return self._ultima_subred
 
     def objetivo_actual(self):
         """Copia del AP objetivo (o None)."""
@@ -1421,6 +1479,10 @@ class PanelWifi(QWidget):
 
     def psk_actual(self) -> str:
         return self._psk
+
+    def cerrar(self) -> None:
+        """Alias de detener(), por si MainWindow lo invoca así."""
+        self.detener()
 
     # =====================================================================
     # CIERRE
